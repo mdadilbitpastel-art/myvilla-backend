@@ -1,0 +1,29 @@
+# Core
+Django>=5.1,<5.2
+
+# GraphQL (Strawberry) + Django integration
+strawberry-graphql[django]>=0.251
+
+# Auth — JSON Web Tokens
+djangorestframework-simplejwt>=5.3
+
+# Postgres driver (binary wheels, no system libpq needed)
+psycopg[binary]>=3.2
+
+# Cross-origin requests from the Next.js frontend
+django-cors-headers>=4.6
+
+# 12-factor settings from environment / .env
+django-environ>=0.11
+
+# Image handling (required by Django's ImageField)
+Pillow>=11.0
+
+# Media storage (2-in-1): local FileSystemStorage in dev, Cloudinary in prod.
+# django-cloudinary-storage is only *used* when CLOUDINARY_URL is set; the
+# packages are always installed so the same image runs in both environments.
+cloudinary>=1.41
+django-cloudinary-storage>=0.3
+
+# Production WSGI server
+gunicorn>=23.0

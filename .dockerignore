@@ -1,0 +1,11 @@
+.env
+*.sqlite3
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.git/
+.gitignore
+.pytest_cache/
+.mypy_cache/
+*.log
