@@ -50,6 +50,10 @@ MIDDLEWARE = [
     # Sits just below CORS so blocked responses still carry CORS headers.
     "config.middleware.SecurityGuardMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    # Serve collected static files (admin assets) directly from the app,
+    # so DEBUG=False in production still delivers CSS/JS. Must sit right
+    # after SecurityMiddleware.
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -146,12 +150,12 @@ if CLOUDINARY_URL:
     INSTALLED_APPS += ["cloudinary_storage", "cloudinary"]
     STORAGES = {
         "default": {"BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage"},
-        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+        "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
     }
 else:
     STORAGES = {
         "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
-        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+        "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
     }
 
 # --------------------------------------------------------------------------- #

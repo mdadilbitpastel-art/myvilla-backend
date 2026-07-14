@@ -27,3 +27,6 @@ django-cloudinary-storage>=0.3
 
 # Production WSGI server
 gunicorn>=23.0
+
+# Serve static files (Django admin CSS/JS) with DEBUG=False in production
+whitenoise>=6.7
