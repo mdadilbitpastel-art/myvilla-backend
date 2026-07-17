@@ -202,6 +202,25 @@ class PropertyMutation:
         return VillaType.from_model(villa, request=info.context.request)
 
     @strawberry.mutation
+    def delete_villa(self, info: strawberry.Info, id: strawberry.ID) -> bool:
+        """
+        Delete a villa the current user owns, along with its photos (files are
+        removed from storage). Returns True on success. Requires a valid session.
+        """
+        user = require_authenticated_user(info)
+
+        villa = Villa.objects.filter(pk=id, owner=user).first()
+        if villa is None:
+            raise GraphQLError("Villa not found.")
+
+        with transaction.atomic():
+            for im in villa.images.all():
+                im.image.delete(save=False)  # drop the stored file (disk/Cloudinary)
+                im.delete()
+            villa.delete()
+        return True
+
+    @strawberry.mutation
     def create_booking(self, info: strawberry.Info, data: BookingInput) -> BookingType:
         """
         Book a villa for the current user (the "Confirm and Pay" action).
