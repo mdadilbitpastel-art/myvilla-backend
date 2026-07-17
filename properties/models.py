@@ -140,3 +140,29 @@ class VillaImage(models.Model):
 
     def __str__(self):
         return f"Image for villa {self.villa_id}"
+
+
+class Favorite(models.Model):
+    """A villa a user has saved to their wishlist. One row per (user, villa)."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="favorites",
+    )
+    villa = models.ForeignKey(
+        Villa, on_delete=models.CASCADE, related_name="favorited_by"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "properties_favorite"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "villa"], name="uniq_favorite_user_villa"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.user_id} ♥ villa {self.villa_id}"

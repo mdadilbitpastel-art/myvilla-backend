@@ -4,7 +4,7 @@ import strawberry
 from django.db.models import Q
 
 from accounts.security import require_authenticated_user
-from properties.models import Booking, Villa
+from properties.models import Booking, Favorite, Villa
 from .types import BookingType, VillaType
 
 
@@ -38,6 +38,18 @@ class PropertyQuery:
         )
         request = info.context.request
         return [BookingType.from_model(b, request=request) for b in bookings]
+
+    @strawberry.field
+    def my_favorites(self, info: strawberry.Info) -> List[VillaType]:
+        """Villas the current user has saved to their wishlist. Requires a session."""
+        user = require_authenticated_user(info)
+        villas = (
+            Villa.objects.filter(favorited_by__user=user)
+            .prefetch_related("images")
+            .order_by("-favorited_by__created_at")
+        )
+        request = info.context.request
+        return [VillaType.from_model(v, request=request) for v in villas]
 
     @strawberry.field
     def my_villas(self, info: strawberry.Info) -> List[VillaType]:

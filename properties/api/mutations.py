@@ -8,7 +8,7 @@ from graphql import GraphQLError
 
 from accounts.security import require_authenticated_user
 from properties.images import data_url_to_file
-from properties.models import Booking, Villa, VillaImage
+from properties.models import Booking, Favorite, Villa, VillaImage
 from .types import BookingInput, BookingType, VillaInput, VillaType
 
 # Upper bound on images per villa (defensive; the UI allows fewer).
@@ -221,6 +221,23 @@ class PropertyMutation:
                 im.image.delete(save=False)  # drop the stored file (disk/Cloudinary)
                 im.delete()
             villa.delete()
+        return True
+
+    @strawberry.mutation
+    def toggle_favorite(self, info: strawberry.Info, villa_id: strawberry.ID) -> bool:
+        """
+        Add or remove a villa from the current user's wishlist. Returns the new
+        state: True if now saved, False if removed. Requires a valid session.
+        """
+        user = require_authenticated_user(info)
+        villa = Villa.objects.filter(pk=villa_id).first()
+        if villa is None:
+            raise GraphQLError("Villa not found.")
+        fav = Favorite.objects.filter(user=user, villa=villa).first()
+        if fav is not None:
+            fav.delete()
+            return False
+        Favorite.objects.create(user=user, villa=villa)
         return True
 
     @strawberry.mutation
