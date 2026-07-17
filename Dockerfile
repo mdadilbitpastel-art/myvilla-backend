@@ -33,6 +33,7 @@ EXPOSE 8000
 # Default = production start: apply migrations, collect static (admin assets),
 # then run gunicorn bound to the platform's $PORT (Render/Heroku set it;
 # falls back to 8000). docker-compose overrides this for local dev.
-CMD python manage.py migrate --noinput \
+CMD python manage.py ensure_schema \
+    && python manage.py migrate --noinput \
     && python manage.py collectstatic --noinput \
     && gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers 3

@@ -92,6 +92,16 @@ DATABASES = {
     )
 }
 
+# One physical Postgres DB is shared across several projects. Isolate this
+# project's tables in a dedicated schema (DB_SCHEMA) so the built-in Django
+# tables (django_migrations, auth_*, admin_*) don't collide across projects —
+# that collision is what produces InconsistentMigrationHistory. Postgres only;
+# the local SQLite fallback ignores it.
+DB_SCHEMA = env("DB_SCHEMA", default="")
+if DB_SCHEMA and "postgresql" in DATABASES["default"].get("ENGINE", ""):
+    DATABASES["default"].setdefault("OPTIONS", {})
+    DATABASES["default"]["OPTIONS"]["options"] = f"-c search_path={DB_SCHEMA}"
+
 # --------------------------------------------------------------------------- #
 # Auth
 # --------------------------------------------------------------------------- #
