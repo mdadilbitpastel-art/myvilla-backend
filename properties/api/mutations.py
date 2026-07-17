@@ -17,6 +17,9 @@ MAX_IMAGES = 15
 # Platform service fee applied on top of the accommodation subtotal.
 SERVICE_FEE_RATE = Decimal("0.141")
 
+# Maximum nights allowed per booking (standard short-stay cap).
+MAX_BOOKING_NIGHTS = 5
+
 
 def _money(value) -> Decimal:
     """Round any numeric to 2 decimal places, half-up (currency)."""
@@ -243,9 +246,16 @@ class PropertyMutation:
             check_out = date.fromisoformat((data.check_out or "").strip())
         except ValueError:
             raise GraphQLError("Please choose valid check-in and check-out dates.")
+        # Check-in can't be in the past (standard booking rule).
+        if check_in < date.today():
+            raise GraphQLError("Check-in date cannot be in the past.")
         nights = (check_out - check_in).days
         if nights < 1:
             raise GraphQLError("Check-out must be after check-in.")
+        if nights > MAX_BOOKING_NIGHTS:
+            raise GraphQLError(
+                f"You can book at most {MAX_BOOKING_NIGHTS} nights per stay."
+            )
 
         # --- Guests ---
         guests = max(1, data.guests)
