@@ -17,6 +17,10 @@ MAX_IMAGES = 15
 # Platform service fee applied on top of the accommodation subtotal.
 SERVICE_FEE_RATE = Decimal("0.141")
 
+# Flat tax on the accommodation subtotal. Mirrored by TAX_RATE in the
+# frontend's lib/pricing.ts — change both together.
+TAX_RATE = Decimal("0.05")
+
 # Maximum nights allowed per booking (standard short-stay cap).
 MAX_BOOKING_NIGHTS = 5
 
@@ -305,7 +309,8 @@ class PropertyMutation:
         price = Decimal(str(villa.price_per_night))
         subtotal = _money(price * nights)
         service_fee = _money(subtotal * SERVICE_FEE_RATE)
-        total = _money(subtotal + service_fee)
+        tax = _money(subtotal * TAX_RATE)
+        total = _money(subtotal + service_fee + tax)
 
         booking = Booking(
             villa=villa,
@@ -317,6 +322,7 @@ class PropertyMutation:
             price_per_night=price,
             subtotal=subtotal,
             service_fee=service_fee,
+            tax=tax,
             total=total,
             payment_method=(data.payment_method or "").strip(),
             card_last4=_mask_account(data.card_number),

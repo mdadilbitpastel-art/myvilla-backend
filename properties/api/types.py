@@ -115,6 +115,7 @@ class BookingType:
     price_per_night: float
     subtotal: float
     service_fee: float
+    tax: float
     total: float
     payment_method: str
     card_last4: str
@@ -151,6 +152,7 @@ class BookingType:
             price_per_night=float(booking.price_per_night),
             subtotal=float(booking.subtotal),
             service_fee=float(booking.service_fee),
+            tax=float(booking.tax),
             total=float(booking.total),
             payment_method=booking.payment_method,
             card_last4=booking.card_last4,

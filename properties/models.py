@@ -89,6 +89,9 @@ class Booking(models.Model):
     price_per_night = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     subtotal = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     service_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    # Flat tax on the accommodation subtotal. Bookings taken before tax existed
+    # keep 0, so their frozen total stays exactly what the guest agreed to.
+    tax = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     total = models.DecimalField(max_digits=10, decimal_places=2, default=0)
 
     # --- Payment (masked) ---
