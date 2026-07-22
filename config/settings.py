@@ -204,6 +204,11 @@ DEFAULT_FROM_EMAIL = env(
 # Frontend base URL — used to build the password-reset link in the email.
 FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000")
 
+# Google Sign-In. Must be the SAME OAuth client id the browser initialises
+# Google Identity Services with (NEXT_PUBLIC_GOOGLE_CLIENT_ID on the frontend):
+# it is the audience every ID token is checked against. Empty = feature off.
+GOOGLE_CLIENT_ID = env("GOOGLE_CLIENT_ID", default="")
+
 # How long a password-reset token stays valid (seconds). Default: 15 minutes.
 PASSWORD_RESET_TIMEOUT = env.int("PASSWORD_RESET_TIMEOUT", default=15 * 60)
 

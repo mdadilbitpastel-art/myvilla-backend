@@ -55,6 +55,11 @@ services:
         value: "True"
       - key: DEFAULT_FROM_EMAIL
         value: "MyVilla <no-reply@myvilla.com>"
+      # Google Sign-In. Public OAuth *web* client id — not a secret, and it has
+      # to match the frontend's NEXT_PUBLIC_GOOGLE_CLIENT_ID exactly, so it
+      # lives here rather than in the dashboard where the two could drift.
+      - key: GOOGLE_CLIENT_ID
+        value: "200247826573-obic2s9dorps8c05lek2htvg6dk7jso1.apps.googleusercontent.com"
       # --- Fill these in the Render dashboard (secrets / optional) ---
       # Cloudinary: REQUIRED for persistent images (Render disk is ephemeral).
       - key: CLOUDINARY_URL

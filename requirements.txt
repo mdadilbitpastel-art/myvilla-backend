@@ -7,6 +7,9 @@ strawberry-graphql[django]>=0.251
 # Auth — JSON Web Tokens
 djangorestframework-simplejwt>=5.3
 
+# Google Sign-In — verifies the ID token's signature locally
+google-auth>=2.35
+
 # Postgres driver (binary wheels, no system libpq needed)
 psycopg[binary]>=3.2
 

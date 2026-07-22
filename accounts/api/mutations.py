@@ -6,6 +6,7 @@ from django.core.validators import validate_email
 from graphql import GraphQLError
 
 from accounts.auth import tokens_for_user
+from accounts.google import verify_google_credential
 from accounts.security import require_authenticated_user
 from .types import AuthPayload, TokenPayload, UserType
 
@@ -75,6 +76,53 @@ class AuthMutation:
 
         if user is None or not user.check_password(password):
             raise GraphQLError("Invalid email or password.")
+        if not user.is_active:
+            raise GraphQLError("This account is disabled.")
+
+        tokens = tokens_for_user(user)
+        return AuthPayload(
+            access_token=tokens["access_token"],
+            refresh_token=tokens["refresh_token"],
+            user=UserType.from_model(user),
+        )
+
+    @strawberry.mutation
+    def google_login(self, credential: str) -> AuthPayload:
+        """
+        Sign in (or sign up) with a Google ID token from the browser.
+
+        Matching is by verified email, so signing in with Google lands the user
+        in their existing MyVilla account rather than creating a duplicate.
+        """
+        profile = verify_google_credential(credential)
+        email = profile["email"]
+
+        user = User.objects.filter(email=email).first()
+        if user is None:
+            # No usable password: this account can only be entered through
+            # Google until the user sets one via the reset-password flow.
+            user = User.objects.create_user(
+                email=email,
+                password=None,
+                full_name=profile["full_name"],
+            )
+            user.set_unusable_password()
+            if profile["avatar"]:
+                user.avatar = profile["avatar"]
+            user.save(update_fields=["password", "avatar"])
+        else:
+            # Fill in only what's still blank — never overwrite what the user
+            # has set themselves in profile settings.
+            updates = []
+            if not user.full_name and profile["full_name"]:
+                user.full_name = profile["full_name"]
+                updates.append("full_name")
+            if not user.avatar and profile["avatar"]:
+                user.avatar = profile["avatar"]
+                updates.append("avatar")
+            if updates:
+                user.save(update_fields=updates)
+
         if not user.is_active:
             raise GraphQLError("This account is disabled.")
 
@@ -209,6 +257,17 @@ class AuthMutation:
             raise GraphQLError("Image is too large. Please choose a smaller one.")
 
         user.avatar = image
+        user.save(update_fields=["avatar", "updated_at"])
+        return UserType.from_model(user)
+
+    @strawberry.mutation
+    def remove_avatar(self, info: strawberry.Info) -> UserType:
+        """
+        Clear the current user's profile picture, putting the account back to
+        the default placeholder the client renders when `avatar` is empty.
+        """
+        user = require_authenticated_user(info)
+        user.avatar = ""
         user.save(update_fields=["avatar", "updated_at"])
         return UserType.from_model(user)
 
