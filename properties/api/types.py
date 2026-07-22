@@ -2,6 +2,14 @@ from typing import List
 
 import strawberry
 
+from datetime import date as _date
+
+from properties import availability
+
+
+def _today():
+    return _date.today()
+
 
 @strawberry.type
 class VillaImageType:
@@ -9,6 +17,80 @@ class VillaImageType:
 
     id: strawberry.ID
     url: str
+
+
+def _hhmm(value) -> str:
+    """A TimeField as the "HH:MM" an <input type="time"> round-trips, or ""."""
+    return value.strftime("%H:%M") if value else ""
+
+
+def _pretty_time(value) -> str:
+    """14:00 -> "2:00 pm" — how the detail page words a check-in/out time."""
+    return value.strftime("%I:%M %p").lstrip("0").lower() if value else ""
+
+
+def _house_rules(villa) -> List[str]:
+    """
+    The host's rules, worded for display. Only the times the host actually
+    filled in appear; the three permissions always do, since "not allowed" is
+    as much an answer as "allowed" and a guest needs to know either way.
+    """
+    rules = []
+    if villa.check_in_time:
+        rules.append(f"Check-in: After {_pretty_time(villa.check_in_time)}")
+    if villa.check_out_time:
+        rules.append(f"Checkout: {_pretty_time(villa.check_out_time)}")
+    rules.append("Pets are allowed" if villa.pets_allowed else "Pets are not allowed")
+    rules.append(
+        "Smoking is allowed" if villa.smoking_allowed else "No smoking"
+    )
+    rules.append(
+        "Events and parties are allowed"
+        if villa.events_allowed
+        else "No events or parties"
+    )
+    return rules
+
+
+@strawberry.type
+class BookedRangeType:
+    """One reservation held on a villa, as its owner sees it."""
+
+    booking_id: strawberry.ID
+    check_in: str
+    check_out: str
+    nights: int
+    guests: int
+    guest_name: str
+
+
+@strawberry.type
+class VillaAvailabilityType:
+    """
+    A villa's calendar, for its owner. `booked_dates` is every night already
+    taken inside the window — the client draws the calendar straight off it
+    instead of re-deriving occupancy from the ranges and getting the half-open
+    end date wrong.
+    """
+
+    villa_id: strawberry.ID
+    window_start: str
+    window_end: str
+    # The host's own booking window: how many days ahead they're open, and the
+    # last date that allows. Editable from the calendar.
+    availability_days: int
+    bookable_until: str
+    is_available_now: bool
+    # The date the villa next frees up, when it's occupied today; "" if free.
+    free_from: str
+    booked_dates: List[str]
+    # Nights the host closed by hand — separate from `booked_dates` so the
+    # calendar can tell "someone booked this" from "I closed this".
+    blocked_dates: List[str]
+    upcoming: List[BookedRangeType]
+    # The largest party already booked in. Lowering capacity below this would
+    # contradict a reservation the host has already accepted.
+    max_booked_guests: int
 
 
 @strawberry.type
@@ -23,9 +105,25 @@ class VillaType:
     description: str
     build_up_area: str
     bedrooms: int
-    bathrooms: int
     guests: int
+    single_bed_rooms: int
+    double_bed_rooms: int
+    availability_days: int
+    bookable_until: str
+    # Nights the host has closed by hand, from today forward. Round-trips
+    # through the edit form, so the calendar there starts where they left it.
+    blocked_dates: List[str]
     services: List[str]
+    # House rules, twice over: the raw "HH:MM" / booleans the wizard needs to
+    # re-populate its own fields when editing, and `house_rules` — the same
+    # thing already worded for the detail page, so both sides can't drift.
+    check_in_time: str
+    check_out_time: str
+    pets_allowed: bool
+    smoking_allowed: bool
+    events_allowed: bool
+    additional_rules: str
+    house_rules: List[str]
     price_per_night: float
     accepted_payments: List[str]
     payout_method: str
@@ -34,9 +132,26 @@ class VillaType:
     photos: List[VillaImageType]
     cover_image: str
     created_at: str
+    # Availability for the dates and party size the caller asked about. With no
+    # dates in the query this still answers for tonight (see availability.py),
+    # so a name-only search can flag a villa that can't be stayed in.
+    is_available: bool
+    unavailable_reason: str
+    # Decided on the server from the request's own token, not by the client
+    # comparing ids. Every owner-only action is enforced server-side anyway
+    # (the mutations filter on `owner=user`); this is what lets the UI offer
+    # the action in the first place, off the same source of truth.
+    is_owner: bool
 
     @classmethod
-    def from_model(cls, villa, request=None) -> "VillaType":
+    def from_model(
+        cls,
+        villa,
+        request=None,
+        is_available: bool = True,
+        unavailable_reason: str = "",
+        viewer=None,
+    ) -> "VillaType":
         def absolute(url: str) -> str:
             # Local storage returns "/media/..."; Cloudinary returns a full URL.
             if request is not None and url and not url.startswith("http"):
@@ -60,9 +175,25 @@ class VillaType:
             description=villa.description,
             build_up_area=villa.build_up_area,
             bedrooms=villa.bedrooms,
-            bathrooms=villa.bathrooms,
             guests=villa.guests,
+            single_bed_rooms=villa.single_bed_rooms,
+            double_bed_rooms=villa.double_bed_rooms,
+            availability_days=villa.availability_days,
+            bookable_until=availability.window_end(villa).isoformat(),
+            blocked_dates=[
+                d.isoformat()
+                for d in villa.blocked_dates.filter(
+                    date__gte=_today()
+                ).values_list("date", flat=True)
+            ],
             services=list(villa.services or []),
+            check_in_time=_hhmm(villa.check_in_time),
+            check_out_time=_hhmm(villa.check_out_time),
+            pets_allowed=villa.pets_allowed,
+            smoking_allowed=villa.smoking_allowed,
+            events_allowed=villa.events_allowed,
+            additional_rules=villa.additional_rules or "",
+            house_rules=_house_rules(villa),
             price_per_night=float(villa.price_per_night),
             accepted_payments=list(villa.accepted_payments or []),
             payout_method=villa.payout_method,
@@ -71,6 +202,9 @@ class VillaType:
             photos=photos,
             cover_image=image_urls[0] if image_urls else "",
             created_at=villa.created_at.isoformat(),
+            is_available=is_available,
+            unavailable_reason=unavailable_reason,
+            is_owner=viewer is not None and viewer.id == villa.owner_id,
         )
 
 
@@ -84,9 +218,22 @@ class VillaInput:
     description: str = ""
     build_up_area: str = ""
     bedrooms: int = 1
-    bathrooms: int = 1
     guests: int = 1
+    single_bed_rooms: int = 0
+    double_bed_rooms: int = 0
+    availability_days: int = 5
+    # Nights the host closed on the calendar. Sent with the rest of the form:
+    # nothing on that calendar is saved until the listing itself is.
+    blocked_dates: List[str] = strawberry.field(default_factory=list)
     services: List[str] = strawberry.field(default_factory=list)
+    # House rules. Times are "HH:MM" (what <input type="time"> gives); an empty
+    # string means the host left it unset.
+    check_in_time: str = ""
+    check_out_time: str = ""
+    pets_allowed: bool = False
+    smoking_allowed: bool = False
+    events_allowed: bool = False
+    additional_rules: str = ""
     price_per_night: float = 0
     accepted_payments: List[str] = strawberry.field(default_factory=list)
     payout_method: str = ""

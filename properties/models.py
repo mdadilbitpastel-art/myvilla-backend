@@ -22,12 +22,39 @@ class Villa(models.Model):
     address = models.CharField(max_length=255, blank=True)
     description = models.TextField(blank=True)
     build_up_area = models.CharField(max_length=120, blank=True)  # e.g. "2000 Square Yards"
+
+    # --- Rooms & beds ---
+    # Guests book the WHOLE villa, never an individual room, so none of this is
+    # inventory to draw down — it's what a guest is shown, and `guests` is the
+    # cap their party size is checked against. The host states the room count
+    # and the guest capacity outright; the bed breakdown is how those rooms are
+    # furnished (a single bed sleeps 1, a double sleeps 2).
     bedrooms = models.PositiveIntegerField(default=1)
-    bathrooms = models.PositiveIntegerField(default=1)
     guests = models.PositiveIntegerField(default=1)
+    single_bed_rooms = models.PositiveIntegerField(default=0)
+    double_bed_rooms = models.PositiveIntegerField(default=0)
+
+    # --- Availability window ---
+    # How many days ahead of today this villa is open for booking. The host
+    # sets it and can move it any time, so a listing is never accidentally
+    # committed further out than its owner is willing to plan. Dates past the
+    # window are shown to guests as not-yet-open rather than free.
+    availability_days = models.PositiveIntegerField(default=5)
 
     # --- Facilities / Extra Services --- (free-form list of labels)
     services = models.JSONField(default=list, blank=True)
+
+    # --- House Rules ---
+    # Set by the host in the wizard and shown verbatim on the villa detail page
+    # — nothing here is assumed on the host's behalf. Times are optional (null =
+    # the host didn't state one, so the page simply doesn't show that line); the
+    # permissions default to False, i.e. not allowed unless the host says so.
+    check_in_time = models.TimeField(null=True, blank=True)
+    check_out_time = models.TimeField(null=True, blank=True)
+    pets_allowed = models.BooleanField(default=False)
+    smoking_allowed = models.BooleanField(default=False)
+    events_allowed = models.BooleanField(default=False)
+    additional_rules = models.TextField(blank=True)
 
     # --- Pricing ---
     price_per_night = models.DecimalField(max_digits=10, decimal_places=2, default=0)
@@ -46,6 +73,10 @@ class Villa(models.Model):
     class Meta:
         db_table = "properties_villa"
         ordering = ["-created_at"]
+
+    # How many guests one bed of each kind sleeps.
+    GUESTS_PER_SINGLE = 1
+    GUESTS_PER_DOUBLE = 2
 
     def __str__(self):
         return f"{self.title} ({self.owner_id})"
@@ -124,6 +155,36 @@ class Booking(models.Model):
 
     def __str__(self):
         return f"Booking #{self.pk} — {self.villa_id} by {self.guest_id}"
+
+
+class VillaBlockedDate(models.Model):
+    """
+    A single night the host has closed by hand.
+
+    Separate from the rolling `availability_days` window on purpose: the window
+    is "how far ahead I'm taking bookings at all" and moves with today, while
+    this is "not this particular night", and it holds however far out it's set.
+    A host can close a date months before the window reaches it; when the window
+    does reach it, guests find it already unavailable.
+    """
+
+    villa = models.ForeignKey(
+        Villa, on_delete=models.CASCADE, related_name="blocked_dates"
+    )
+    date = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "properties_villa_blocked_date"
+        ordering = ["date"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["villa", "date"], name="uniq_blocked_villa_date"
+            )
+        ]
+
+    def __str__(self):
+        return f"Villa {self.villa_id} blocked on {self.date}"
 
 
 class VillaImage(models.Model):
