@@ -7,7 +7,7 @@ from django.db import transaction
 from graphql import GraphQLError
 
 from accounts.security import require_authenticated_user
-from properties import availability
+from properties import availability, whatsapp
 from properties.images import data_url_to_file
 from properties.models import Booking, Favorite, Villa, VillaBlockedDate, VillaImage
 from .types import BookingInput, BookingType, VillaInput, VillaType
@@ -438,7 +438,17 @@ class PropertyMutation:
                 )
             booking.save()
 
-        return BookingType.from_model(booking, request=info.context.request)
+        # Greet the guest on WhatsApp with the villa's photo and their trip's
+        # details. Fired after the transaction commits (there is no booking to
+        # announce before that) and in the background — the payment response
+        # must not wait on Meta, and a failure there is not a failed booking.
+        request = info.context.request
+        cover = villa.cover_image_url
+        if cover and not cover.startswith("http") and request is not None:
+            cover = request.build_absolute_uri(cover)
+        whatsapp.send_booking_confirmation(booking, cover)
+
+        return BookingType.from_model(booking, request=request)
 
     @strawberry.mutation
     def cancel_booking(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:

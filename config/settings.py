@@ -213,6 +213,25 @@ GOOGLE_CLIENT_ID = env("GOOGLE_CLIENT_ID", default="")
 PASSWORD_RESET_TIMEOUT = env.int("PASSWORD_RESET_TIMEOUT", default=15 * 60)
 
 # --------------------------------------------------------------------------- #
+# WhatsApp — Meta Cloud API. Greets a guest with their booking the moment it is
+# paid for (properties/whatsapp.py, which documents the template to submit).
+# Leave WHATSAPP_TOKEN empty and the feature is off: the message that would
+# have gone out is written to the logs instead, exactly like the console e-mail
+# backend in dev. The frontend's own "Share on WhatsApp" card stays either way.
+# --------------------------------------------------------------------------- #
+WHATSAPP_TOKEN = env("WHATSAPP_TOKEN", default="")
+WHATSAPP_PHONE_NUMBER_ID = env("WHATSAPP_PHONE_NUMBER_ID", default="")
+# Name of the Meta-approved template. Empty = plain text, which WhatsApp only
+# delivers inside the 24h window after the user messaged first (testing only).
+WHATSAPP_TEMPLATE_NAME = env("WHATSAPP_TEMPLATE_NAME", default="")
+WHATSAPP_TEMPLATE_LANG = env("WHATSAPP_TEMPLATE_LANG", default="en")
+# Set true if the template ends in a dynamic URL button (gets "villa/<id>").
+WHATSAPP_TEMPLATE_URL_BUTTON = env("WHATSAPP_TEMPLATE_URL_BUTTON", default="")
+# Country code for numbers saved without one, digits only, e.g. "91".
+WHATSAPP_DEFAULT_DIAL_CODE = env("WHATSAPP_DEFAULT_DIAL_CODE", default="")
+WHATSAPP_API_VERSION = env("WHATSAPP_API_VERSION", default="v21.0")
+
+# --------------------------------------------------------------------------- #
 # Cache — backs rate limiting / IP blocking.
 # LocMemCache is per-process (fine for dev / single worker). In production set
 # REDIS_URL so all workers share one counter (dependency-free RedisCache).
