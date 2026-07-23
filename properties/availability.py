@@ -137,5 +137,10 @@ def unavailable_reason(
     if blocked_on:
         return f"Not available on {blocked_on.strftime('%d %b %Y')}"
     if free_from:
-        return f"Booked until {free_from.strftime('%d %b %Y')}"
+        # `free_from` is a check-out date, and a check-out day is not a night of
+        # the stay — the villa is free that morning. So the last night actually
+        # taken is the day before, and that is the date to name: a stay of the
+        # 24th (checking out on the 25th) is "Booked until 24", not 25.
+        last_night = free_from - timedelta(days=1)
+        return f"Booked until {last_night.strftime('%d %b %Y')}"
     return ""
