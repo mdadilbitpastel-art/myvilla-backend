@@ -28,6 +28,9 @@ User = get_user_model()
 # them without touching real accounts.
 DEMO_DOMAIN = "demo.myvilla"
 
+# A pool of demo reviewers, balanced male/female, each with a real portrait
+# photo from pravatar.cc (the `img` number). Enough distinct people (18) so a
+# single property can carry 10-12 reviews without repeating a reviewer.
 REVIEWERS = [
     ("Aarav Mehta", "Male", 12),
     ("Priya Sharma", "Female", 5),
@@ -41,27 +44,44 @@ REVIEWERS = [
     ("Isha Verma", "Female", 31),
     ("Daniel Foster", "Male", 60),
     ("Emily Carter", "Female", 9),
+    ("Rahul Khanna", "Male", 8),
+    ("Nisha Pillai", "Female", 16),
+    ("James Bennett", "Male", 52),
+    ("Sofia Rossi", "Female", 20),
+    ("Aditya Rao", "Male", 3),
+    ("Fatima Sheikh", "Female", 49),
 ]
 
+# Names of common facilities, dropped into a few templates so the reviews read
+# like they're about a real stay rather than generic praise.
+FEATURES = ["pool", "kitchen", "wifi", "parking", "balcony", "garden", "AC"]
+
 # (rating, comment) templates of varied length/tone. Weighted toward the happy
-# end, like a real listing, but with honest 3-4★ notes mixed in.
+# end, like a real listing, but with honest 3-4★ notes mixed in. A "{f}" slot
+# is filled with a random facility so the review reads specific, not canned.
 REVIEW_POOL = [
     (5, "Absolutely stunning property! The photos don't do it justice. Spotlessly clean, the host was super responsive, and the location was perfect for our family getaway. Would book again in a heartbeat."),
-    (5, "One of the best stays we've had. Check-in was smooth, the beds were incredibly comfortable, and the view in the morning was unreal."),
-    (5, "Perfect little escape. Quiet, private and exactly as described. The kitchen had everything we needed."),
-    (4, "Really lovely place and great value. Only small thing was the wifi dropped once or twice, but the host sorted it quickly."),
-    (5, "Hosted a small family celebration here and it was magical. Spacious, well-kept and the host went above and beyond."),
-    (4, "Comfortable and clean, close to everything we wanted to see. Would have liked a bit more kitchenware but overall a great stay."),
-    (5, "Booked it for a weekend and never wanted to leave. Immaculate rooms, warm host, and the pool was a huge bonus for the kids."),
-    (5, "Business trip made so much easier by this stay. Fast check-in, quiet at night, and a solid workspace. Highly recommend."),
-    (3, "Decent stay overall. The place is nice and the host is polite, but it was a little further from the center than we expected. Fine for the price."),
-    (4, "Beautiful interiors and very peaceful. Check-in was a touch late but the host apologised and made up for it."),
-    (5, "Can't fault it. Clean, cosy and the host left us a lovely welcome note. This is how hosting should be done."),
-    (5, "Second time staying here and it's become our go-to. Consistent, spotless and always a warm welcome."),
-    (4, "Great for a couples getaway. Romantic setting, comfy bed, good amenities. A few more towels would've been nice."),
-    (5, "The whole villa to ourselves felt like a proper luxury. Kids loved the space, we loved the calm. Ten out of ten."),
-    (3, "Nice property and honest listing. Parking was a bit tight, but the stay itself was comfortable and the host responsive."),
-    (4, "Solid stay, would recommend. Clean, quiet, and the check-out process was refreshingly simple."),
+    (5, "One of the best stays we've had. Check-in was smooth, the beds were incredibly comfortable, and the view in the morning was unreal. The {f} was a lovely touch."),
+    (5, "Perfect little escape. Quiet, private and exactly as described. The {f} made it feel like home and the kitchen had everything we needed."),
+    (4, "Really lovely place and great value. Only small thing was the wifi dropped once or twice, but the host sorted it out within the hour."),
+    (5, "Hosted a small family celebration here and it was magical. Spacious, well-kept, and the host went above and beyond to make sure we had everything."),
+    (4, "Comfortable and clean, close to everything we wanted to see. Would have liked a bit more kitchenware, but overall a really pleasant stay."),
+    (5, "Booked it for a long weekend and never wanted to leave. Immaculate rooms, a warm host, and the {f} was a huge bonus for the kids."),
+    (5, "Business trip made so much easier by this stay. Fast check-in, quiet at night, strong wifi and a proper workspace. Highly recommend for solo travellers."),
+    (3, "Decent stay overall. The place is nice and the host is polite, but it was a little further from the centre than we expected. Fair for the price though."),
+    (4, "Beautiful interiors and very peaceful. Check-in was a touch late, but the host apologised and even threw in a late checkout to make up for it."),
+    (5, "Can't fault it. Clean, cosy, and the host left us a lovely welcome note and local tips. This is exactly how hosting should be done."),
+    (5, "Second time staying here and it's become our go-to. Consistent, spotless, and always a warm welcome. The {f} is our favourite part."),
+    (4, "Great for a couples getaway. Romantic setting, comfy bed and good amenities. A few more towels would've been nice, but a small thing."),
+    (5, "The whole villa to ourselves felt like a proper luxury. Kids loved the space, we loved the calm. Ten out of ten, will be back next season."),
+    (3, "Nice property and an honest listing. Parking was a bit tight on our street, but the stay itself was comfortable and the host was quick to reply."),
+    (4, "Solid stay, would recommend. Clean, quiet, and the check-out process was refreshingly simple. The {f} was better than the photos showed."),
+    (5, "We travelled with elderly parents and everyone was comfortable. Ground-floor rooms, spotless bathrooms and a host who genuinely cared. Thank you!"),
+    (5, "Woke up to birdsong every morning. The {f} was spotless and the whole place had a calm, homely feel. Already recommended it to two friends."),
+    (4, "Good location, easy self check-in, and very clean. It got a little warm in the afternoon but the AC handled it fine. Would stay again."),
+    (5, "Exceptional value for what you get. Big rooms, fast wifi, and the host shared great food recommendations nearby. Couldn't have asked for more."),
+    (5, "A proper home away from home. Everything worked, everything was clean, and the {f} made the evenings special. Five stars, no hesitation."),
+    (4, "Lovely stay for our anniversary. Peaceful and private. Only note is the road in is a bit narrow, but nothing that spoiled the trip."),
 ]
 
 
@@ -69,7 +89,7 @@ class Command(BaseCommand):
     help = "Seed demo reviewers and reviews across all villas."
 
     def add_arguments(self, parser):
-        parser.add_argument("--per", type=int, default=5, help="Max reviews per villa.")
+        parser.add_argument("--per", type=int, default=12, help="Max reviews per villa.")
         parser.add_argument(
             "--clear",
             action="store_true",
@@ -118,12 +138,15 @@ class Command(BaseCommand):
                     "guest_id", flat=True
                 )
             )
-            # A different-but-stable number of reviews per villa.
+            # A different-but-stable number of reviews per villa (10-12 by
+            # default), capped by how many fresh reviewers remain.
             want = rng.randint(max(1, per - 2), per)
             pool = [u for u in users if u.id not in already]
             rng.shuffle(pool)
             for user in pool[:want]:
                 rating, comment = rng.choice(REVIEW_POOL)
+                # Fill the "{f}" facility slot so the text reads specific.
+                comment = comment.replace("{f}", rng.choice(FEATURES))
                 Review.objects.create(
                     villa=villa,
                     guest=user,
