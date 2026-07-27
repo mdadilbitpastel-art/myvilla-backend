@@ -1,16 +1,34 @@
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List
 
 import strawberry
 from django.db import transaction
+from django.utils import timezone
 from graphql import GraphQLError
 
 from accounts.security import require_authenticated_user
-from properties import availability, whatsapp
+from properties import availability, coupons as coupon_utils, whatsapp
 from properties.images import data_url_to_file
-from properties.models import Booking, Favorite, Villa, VillaBlockedDate, VillaImage
-from .types import BookingInput, BookingType, VillaInput, VillaType
+from properties.models import (
+    Booking,
+    Coupon,
+    Favorite,
+    Review,
+    Villa,
+    VillaBlockedDate,
+    VillaImage,
+)
+from .types import (
+    BookingInput,
+    BookingType,
+    CouponInput,
+    CouponType,
+    VillaInput,
+    VillaType,
+    _clean_extra_services,
+)
 
 # Upper bound on images per villa (defensive; the UI allows fewer).
 MAX_IMAGES = 15
@@ -22,11 +40,14 @@ SERVICE_FEE_RATE = Decimal("0.141")
 # frontend's lib/pricing.ts — change both together.
 TAX_RATE = Decimal("0.05")
 
-# The platform's ceiling on a single stay.
-MAX_BOOKING_NIGHTS = 30
-
 # How far ahead a host may open their calendar (see Villa.availability_days).
 MAX_AVAILABILITY_DAYS = 365
+
+# The ceiling on a single stay is the host's own window, not a number of ours:
+# a villa opened for two months can be booked for two months. This constant is
+# only the outer bound that window can ever reach, kept so an absurd request is
+# still refused with a sentence rather than by arithmetic.
+MAX_BOOKING_NIGHTS = MAX_AVAILABILITY_DAYS
 
 
 def _money(value) -> Decimal:
@@ -47,6 +68,28 @@ def _mask_account(raw: str) -> str:
     if len(digits) >= 4:
         return "•••• " + digits[-4:]
     return account
+
+
+# Payment methods whose guest flow is a card (number + expiry + CVV). Anything
+# else (PayPal, Google Pay) is an account-based flow with no card fields.
+CARD_PAYMENT_METHODS = {"Visa", "Mastercard", "Credit Card", "Debit Card"}
+
+
+def _mask_reference(raw: str) -> str:
+    """Mask a PayPal / Google Pay account for storage.
+
+    E-mails and UPI ids ("name@bank") keep their first character and domain
+    ("j••••@gmail.com"); anything else is masked to its last 4 digits. Capped to
+    the Booking.card_last4 column width.
+    """
+    ref = (raw or "").strip()
+    if not ref:
+        return ""
+    if "@" in ref:
+        local, _, domain = ref.partition("@")
+        head = local[:1] or "•"
+        return f"{head}{'•' * 4}@{domain}"[:24]
+    return _mask_account(ref)[:24]
 
 
 def _parse_time(value: str, label: str):
@@ -185,6 +228,7 @@ def _apply_fields(villa: Villa, data: VillaInput, title, accepted, payout_accoun
         + villa.double_bed_rooms * Villa.GUESTS_PER_DOUBLE
     )
     villa.services = [s.strip() for s in (data.services or []) if s.strip()]
+    villa.extra_services = _clean_extra_services(data.extra_services)
     villa.check_in_time = _parse_time(data.check_in_time, "check-in")
     villa.check_out_time = _parse_time(data.check_out_time, "check-out")
     villa.pets_allowed = bool(data.pets_allowed)
@@ -197,8 +241,134 @@ def _apply_fields(villa: Villa, data: VillaInput, title, accepted, payout_accoun
     villa.payout_account = payout_account
 
 
+# Codes are stored upper-cased; this is what a valid one may contain.
+_COUPON_CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{2,31}$")
+
+
+def _coupon_date(value: str, label: str):
+    """An optional "YYYY-MM-DD" from the coupon form, or None when left blank."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        raise GraphQLError(f"Enter a valid {label} date, or leave it empty.")
+
+
+def _clean_coupon_input(user, data: CouponInput, exclude_id=None):
+    """
+    Validate a coupon create/update. Returns (code, villa_or_None, discount_type,
+    discount_value, valid_from, valid_until). Raises GraphQLError with a clear
+    message on any problem.
+
+    The host must own at least one villa to have coupons at all; a villa-scoped
+    coupon must name a villa they own; a common coupon (blank villa) covers them
+    all. Codes are unique platform-wide, case-insensitively.
+    """
+    if not Villa.objects.filter(owner=user).exists():
+        raise GraphQLError("Add a property before creating a coupon.")
+
+    code = coupon_utils.normalise_code(data.code)
+    if not _COUPON_CODE_RE.match(code):
+        raise GraphQLError(
+            "Use 3–32 letters or numbers for the code (dashes and underscores allowed)."
+        )
+    clash = Coupon.objects.filter(code=code)
+    if exclude_id is not None:
+        clash = clash.exclude(pk=exclude_id)
+    if clash.exists():
+        raise GraphQLError("That coupon code is already taken. Try another.")
+
+    villa = None
+    if (data.villa_id or "").strip():
+        villa = Villa.objects.filter(pk=data.villa_id, owner=user).first()
+        if villa is None:
+            raise GraphQLError("Choose one of your own villas, or leave it for all.")
+
+    discount_type = (data.discount_type or "").strip().lower()
+    if discount_type not in (Coupon.TYPE_PERCENT, Coupon.TYPE_FIXED):
+        raise GraphQLError("Choose a percentage or a fixed amount.")
+
+    value = Decimal(str(data.discount_value or 0))
+    if discount_type == Coupon.TYPE_PERCENT:
+        if value <= 0 or value > 100:
+            raise GraphQLError("A percentage discount must be between 1 and 100.")
+    else:
+        if value <= 0:
+            raise GraphQLError("Enter a discount amount greater than zero.")
+
+    # --- Validity period: both ends optional, both inclusive ---
+    valid_from = _coupon_date(data.valid_from, "start")
+    valid_until = _coupon_date(data.valid_until, "expiry")
+    # Judged on the server's date — the same clock resolve_coupon will use when
+    # a guest tries the code, so the host can't save something that is already
+    # dead on arrival by the server's reckoning.
+    today = timezone.localdate()
+    if valid_until and valid_until < today:
+        raise GraphQLError(
+            "The expiry date has already passed. Pick today or a later date."
+        )
+    if valid_from and valid_until and valid_until < valid_from:
+        raise GraphQLError("The expiry date must be on or after the start date.")
+
+    return code, villa, discount_type, _money(value), valid_from, valid_until
+
+
 @strawberry.type
 class PropertyMutation:
+    @strawberry.mutation
+    def create_coupon(self, info: strawberry.Info, data: CouponInput) -> CouponType:
+        """Create a discount code on the current user's villa(s)."""
+        user = require_authenticated_user(info)
+        code, villa, discount_type, value, valid_from, valid_until = _clean_coupon_input(
+            user, data
+        )
+        coupon = Coupon.objects.create(
+            owner=user,
+            villa=villa,
+            code=code,
+            discount_type=discount_type,
+            discount_value=value,
+            active=bool(data.active),
+            valid_from=valid_from,
+            valid_until=valid_until,
+        )
+        return CouponType.from_model(coupon)
+
+    @strawberry.mutation
+    def update_coupon(
+        self, info: strawberry.Info, id: strawberry.ID, data: CouponInput
+    ) -> CouponType:
+        """Update a coupon the current user owns."""
+        user = require_authenticated_user(info)
+        coupon = Coupon.objects.filter(pk=id, owner=user).first()
+        if coupon is None:
+            raise GraphQLError("Coupon not found.")
+        code, villa, discount_type, value, valid_from, valid_until = _clean_coupon_input(
+            user, data, exclude_id=coupon.pk
+        )
+        coupon.code = code
+        coupon.villa = villa
+        coupon.discount_type = discount_type
+        coupon.discount_value = value
+        coupon.active = bool(data.active)
+        coupon.valid_from = valid_from
+        coupon.valid_until = valid_until
+        coupon.save()
+        coupon = Coupon.objects.select_related("villa").get(pk=coupon.pk)
+        return CouponType.from_model(coupon)
+
+    @strawberry.mutation
+    def delete_coupon(self, info: strawberry.Info, id: strawberry.ID) -> bool:
+        """Delete a coupon the current user owns. Returns True on success."""
+        user = require_authenticated_user(info)
+        coupon = Coupon.objects.filter(pk=id, owner=user).first()
+        if coupon is None:
+            raise GraphQLError("Coupon not found.")
+        coupon.delete()
+        return True
+
     @strawberry.mutation
     def create_villa(self, info: strawberry.Info, data: VillaInput) -> VillaType:
         """
@@ -349,15 +519,39 @@ class PropertyMutation:
             check_out = date.fromisoformat((data.check_out or "").strip())
         except ValueError:
             raise GraphQLError("Please choose valid check-in and check-out dates.")
-        # Check-in can't be in the past (standard booking rule).
-        if check_in < date.today():
-            raise GraphQLError("Check-in date cannot be in the past.")
         nights = (check_out - check_in).days
         if nights < 1:
             raise GraphQLError("Check-out must be after check-in.")
         if nights > MAX_BOOKING_NIGHTS:
             raise GraphQLError(
                 f"You can book at most {MAX_BOOKING_NIGHTS} nights per stay."
+            )
+
+        # --- The host's booking window ---
+        # The one rule the calendar draws (see availability.py): the villa is
+        # open for `availability_days` dates starting at the first date a guest
+        # could still arrive. Re-derived here from the clock, never taken from
+        # the client — the page may have been open for hours.
+        first_open = availability.first_bookable_date(villa)
+        last_open = availability.last_bookable_date(villa)
+        cutoff = availability.check_in_cutoff(villa).strftime("%I:%M %p").lstrip("0")
+        if check_in < first_open:
+            if check_in < date.today():
+                raise GraphQLError("Check-in date cannot be in the past.")
+            # Today, but the door has already closed on it.
+            raise GraphQLError(
+                f"Check-in for {check_in.strftime('%d %b %Y')} closed at {cutoff}. "
+                "Please choose a later date."
+            )
+        if check_in > last_open:
+            raise GraphQLError(
+                f"This villa is only open for bookings up to "
+                f"{last_open.strftime('%d %b %Y')}. Please choose an earlier check-in date."
+            )
+        if check_out > availability.window_end(villa):
+            raise GraphQLError(
+                f"This villa is only open for bookings up to "
+                f"{last_open.strftime('%d %b %Y')}. Please shorten your stay."
             )
 
         # --- Guests: the villa's stated capacity is a hard cap ---
@@ -369,35 +563,97 @@ class PropertyMutation:
             )
 
         # --- Payment details ---
-        if not (data.payment_method or "").strip():
-            raise GraphQLError("Please choose a card type.")
-        if len(_digits(data.card_number)) < 12:
-            raise GraphQLError("Enter a valid card number.")
-        if not (data.expiration or "").strip():
-            raise GraphQLError("Enter the card expiration date.")
-        cvv = _digits(data.cvv)
-        if len(cvv) < 3 or len(cvv) > 4:
-            raise GraphQLError("Enter a valid CVV.")
+        # The guest pays with ONE of the methods the host accepts. Card brands
+        # (Visa/Mastercard) need card fields + a billing address; PayPal and
+        # Google Pay need only the account reference. We validate exactly what
+        # the chosen method requires so a PayPal booking isn't rejected for a
+        # missing card, and vice-versa.
+        method = (data.payment_method or "").strip()
+        if not method:
+            raise GraphQLError("Please choose a payment method.")
+        # The host must actually accept this method (defence in depth — the UI
+        # only offers accepted ones, but the client can't be trusted).
+        accepted = [str(p).strip() for p in (villa.accepted_payments or []) if str(p).strip()]
+        if accepted and method not in accepted:
+            raise GraphQLError("This villa does not accept that payment method.")
 
-        # --- Billing address (mandatory core fields) ---
-        if not (data.billing_street or "").strip():
-            raise GraphQLError("Enter your billing street name.")
-        if not (data.billing_city or "").strip():
-            raise GraphQLError("Enter your billing city.")
-        if not (data.billing_country or "").strip():
-            raise GraphQLError("Select your billing country or region.")
+        is_card = method in CARD_PAYMENT_METHODS
+        if is_card:
+            if len(_digits(data.card_number)) < 12:
+                raise GraphQLError("Enter a valid card number.")
+            if not (data.expiration or "").strip():
+                raise GraphQLError("Enter the card expiration date.")
+            cvv = _digits(data.cvv)
+            if len(cvv) < 3 or len(cvv) > 4:
+                raise GraphQLError("Enter a valid CVV.")
+
+            # --- Billing address (mandatory for card payments) ---
+            if not (data.billing_street or "").strip():
+                raise GraphQLError("Enter your billing street name.")
+            if not (data.billing_city or "").strip():
+                raise GraphQLError("Enter your billing city.")
+            if not (data.billing_country or "").strip():
+                raise GraphQLError("Select your billing country or region.")
+            payment_reference = _mask_account(data.card_number)
+        else:
+            # Account-based methods (PayPal / Google Pay): the reference must be
+            # an e-mail / UPI-style handle.
+            reference = (data.payment_detail or "").strip()
+            if "@" not in reference:
+                if method == "PayPal":
+                    raise GraphQLError("Enter the e-mail for your PayPal account.")
+                raise GraphQLError(
+                    "Enter your UPI ID (name@bank) or Google account e-mail."
+                )
+            payment_reference = _mask_reference(reference)
 
         # --- Additional information ---
         email = (data.contact_email or "").strip()
         if "@" not in email or "." not in email:
             raise GraphQLError("Enter a valid e-mail address.")
 
+        # --- Coupon (optional): re-resolved and applied on the server ---
+        # The page's preview is advisory only; whether a code applies and how
+        # much it takes off is decided here, against this villa, so a tampered
+        # or since-deactivated code can't slip through.
+        try:
+            coupon = coupon_utils.resolve_coupon(data.coupon_code, villa)
+        except coupon_utils.CouponError as exc:
+            raise GraphQLError(str(exc))
+
+        # --- Extra services (frozen server-side) ---
+        # The guest sends only the NAMES they ticked; each price is taken from
+        # the villa's own configured list, so a tampered client price can't get
+        # through. Each service is charged per night. Unknown names are ignored.
+        villa_extras = {
+            str(s.get("name", "")).strip().lower(): s
+            for s in (villa.extra_services or [])
+            if isinstance(s, dict) and str(s.get("name", "")).strip()
+        }
+        chosen_extras = []
+        for raw_name in (data.extra_services or []):
+            key = str(raw_name or "").strip().lower()
+            svc = villa_extras.get(key)
+            if svc is None or key in {c["name"].lower() for c in chosen_extras}:
+                continue
+            chosen_extras.append(
+                {"name": str(svc.get("name", "")).strip(), "price": _money(Decimal(str(svc.get("price", 0) or 0)))}
+            )
+        extras_per_night = sum((c["price"] for c in chosen_extras), Decimal("0.00"))
+        extras_total = _money(extras_per_night * nights)
+        # Store the price as a plain number (JSON), not a Decimal.
+        chosen_extras = [{"name": c["name"], "price": float(c["price"])} for c in chosen_extras]
+
         # --- Money (frozen server-side) ---
         price = Decimal(str(villa.price_per_night))
         subtotal = _money(price * nights)
+        discount = coupon_utils.discount_for(coupon, subtotal) if coupon else Decimal("0.00")
         service_fee = _money(subtotal * SERVICE_FEE_RATE)
         tax = _money(subtotal * TAX_RATE)
-        total = _money(subtotal + service_fee + tax)
+        # Discount comes off the accommodation; fee and tax are on the full
+        # subtotal (mirrors the frontend's computeStayPricing). Extra services
+        # are added straight on top — no fee or tax on them.
+        total = _money(subtotal - discount + service_fee + tax + extras_total)
 
         booking = Booking(
             villa=villa,
@@ -406,13 +662,24 @@ class PropertyMutation:
             check_out=check_out,
             nights=nights,
             guests=guests,
+            # Frozen villa snapshot — these must not change if the host later
+            # edits the listing (see Booking).
+            villa_title=villa.title,
+            villa_city=villa.city,
+            villa_country=villa.country,
+            check_in_time=villa.check_in_time,
+            check_out_time=villa.check_out_time,
             price_per_night=price,
             subtotal=subtotal,
+            discount=discount,
+            coupon_code=coupon.code if coupon else "",
             service_fee=service_fee,
             tax=tax,
+            extra_services=chosen_extras,
+            extras_total=extras_total,
             total=total,
-            payment_method=(data.payment_method or "").strip(),
-            card_last4=_mask_account(data.card_number),
+            payment_method=method,
+            card_last4=payment_reference,
             billing_street=(data.billing_street or "").strip(),
             billing_apartment=(data.billing_apartment or "").strip(),
             billing_city=(data.billing_city or "").strip(),
@@ -424,18 +691,37 @@ class PropertyMutation:
         )
 
         # --- The date check, made final ---
-        # The villa must be free for these exact nights. It's re-checked inside
-        # the transaction, immediately before the row is written: the page the
-        # guest is looking at was rendered seconds ago, and someone else may
-        # have taken the same nights since. Locking the villa row makes two
-        # simultaneous bookings queue rather than both find the villa free.
+        # Everything time-sensitive is checked AGAIN here, inside the
+        # transaction and immediately before the row is written. Filling in a
+        # payment form takes minutes, and two things can change underneath it:
+        # the villa's check-in time can go by (so the stay's first night is no
+        # longer reachable), and another guest can take the same nights.
+        # Locking the villa row makes two simultaneous bookings queue rather
+        # than both find the villa free.
         with transaction.atomic():
             Villa.objects.select_for_update().filter(pk=villa.pk).first()
+
+            if check_in < availability.first_bookable_date(villa):
+                raise GraphQLError(
+                    f"The {cutoff} check-in time for "
+                    f"{check_in.strftime('%d %b %Y')} passed while you were checking "
+                    "out, so this stay can no longer start that day. Nothing has been "
+                    "charged — please pick new dates."
+                )
+
+            blocked_on = availability.is_blocked(villa.pk, check_in, check_out)
+            if blocked_on:
+                raise GraphQLError(
+                    f"The host has just closed {blocked_on.strftime('%d %b %Y')}. "
+                    "Nothing has been charged — please choose different dates."
+                )
+
             if availability.is_booked(villa.pk, check_in, check_out):
                 raise GraphQLError(
-                    "Sorry, this villa is already booked for those dates. "
-                    "Please choose different dates."
+                    "Someone else booked these dates while you were checking out. "
+                    "Nothing has been charged — please choose different dates."
                 )
+
             booking.save()
 
         # Greet the guest on WhatsApp with the villa's photo and their trip's
@@ -452,26 +738,121 @@ class PropertyMutation:
 
     @strawberry.mutation
     def cancel_booking(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
-        """Cancel one of the current user's own bookings."""
+        """
+        Cancel one of the current user's own bookings. Refused once the host has
+        checked the guest in — a stay under way can't be called off. A late
+        cancellation (inside the free window) carries a fine, computed and
+        frozen here so what the guest is charged doesn't drift as time passes.
+        """
         user = require_authenticated_user(info)
-        booking = Booking.objects.filter(pk=id, guest=user).first()
+        booking = (
+            Booking.objects.select_related("villa", "guest", "villa__owner", "review")
+            .filter(pk=id, guest=user)
+            .first()
+        )
         if booking is None:
             raise GraphQLError("Booking not found.")
+        if booking.status == Booking.STATUS_CANCELLED:
+            raise GraphQLError("This booking is already cancelled.")
+        if booking.checked_in_at is not None:
+            raise GraphQLError(
+                "You're already checked in — this stay can no longer be cancelled."
+            )
+        now = timezone.now()
+        booking.cancellation_fee = booking.cancel_fee_at(now)
+        booking.cancelled_at = now
         booking.status = Booking.STATUS_CANCELLED
-        booking.save(update_fields=["status", "updated_at"])
+        booking.save(
+            update_fields=["status", "cancelled_at", "cancellation_fee", "updated_at"]
+        )
         return BookingType.from_model(booking, request=info.context.request)
 
     @strawberry.mutation
-    def respond_booking(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
-        """Host responds to a rent request on a villa they own."""
+    def check_in_booking(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
+        """
+        Host marks the guest as arrived on a booking for a villa they own.
+        Records the moment now. Owner-only; can't check in a cancelled stay or
+        one already checked in.
+        """
         user = require_authenticated_user(info)
         booking = (
-            Booking.objects.select_related("villa", "guest")
+            Booking.objects.select_related("villa", "guest", "villa__owner", "review")
             .filter(pk=id, villa__owner=user)
             .first()
         )
         if booking is None:
-            raise GraphQLError("Rent request not found.")
-        booking.host_responded = True
-        booking.save(update_fields=["host_responded", "updated_at"])
+            raise GraphQLError("Booking not found.")
+        if booking.status == Booking.STATUS_CANCELLED:
+            raise GraphQLError("This booking was cancelled.")
+        if booking.checked_in_at is not None:
+            raise GraphQLError("This guest is already checked in.")
+        booking.checked_in_at = timezone.now()
+        booking.save(update_fields=["checked_in_at", "updated_at"])
+        return BookingType.from_model(booking, request=info.context.request)
+
+    @strawberry.mutation
+    def check_out_booking(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
+        """
+        Host marks the guest as departed. Records the moment now. Owner-only;
+        requires a prior check-in and refuses a second check-out.
+        """
+        user = require_authenticated_user(info)
+        booking = (
+            Booking.objects.select_related("villa", "guest", "villa__owner", "review")
+            .filter(pk=id, villa__owner=user)
+            .first()
+        )
+        if booking is None:
+            raise GraphQLError("Booking not found.")
+        if booking.status == Booking.STATUS_CANCELLED:
+            raise GraphQLError("This booking was cancelled.")
+        if booking.checked_in_at is None:
+            raise GraphQLError("Check the guest in first.")
+        if booking.checked_out_at is not None:
+            raise GraphQLError("This guest is already checked out.")
+        booking.checked_out_at = timezone.now()
+        booking.save(update_fields=["checked_out_at", "updated_at"])
+        return BookingType.from_model(booking, request=info.context.request)
+
+    @strawberry.mutation
+    def submit_review(
+        self,
+        info: strawberry.Info,
+        booking_id: strawberry.ID,
+        rating: int,
+        comment: str = "",
+    ) -> BookingType:
+        """
+        Leave (or update) the guest's review for one of their COMPLETED stays.
+        Guest-only, and only after check-out — you can't rate a stay that hasn't
+        happened. One review per booking; submitting again edits it. Returns the
+        booking so the caller's list refreshes with the new review in place.
+        """
+        user = require_authenticated_user(info)
+        booking = Booking.objects.select_related("villa").filter(
+            pk=booking_id, guest=user
+        ).first()
+        if booking is None:
+            raise GraphQLError("Booking not found.")
+        if booking.status == Booking.STATUS_CANCELLED:
+            raise GraphQLError("A cancelled booking can't be reviewed.")
+        if booking.checked_out_at is None:
+            raise GraphQLError("You can review a stay once it's completed.")
+        stars = int(rating)
+        if stars < Review.RATING_MIN or stars > Review.RATING_MAX:
+            raise GraphQLError("Please give a rating between 1 and 5 stars.")
+        Review.objects.update_or_create(
+            booking=booking,
+            defaults={
+                "villa": booking.villa,
+                "guest": user,
+                "rating": stars,
+                "comment": (comment or "").strip()[:2000],
+            },
+        )
+        # Re-fetch so the reverse one-to-one `review` is freshly loaded.
+        booking = (
+            Booking.objects.select_related("villa", "guest", "villa__owner", "review")
+            .get(pk=booking.pk)
+        )
         return BookingType.from_model(booking, request=info.context.request)

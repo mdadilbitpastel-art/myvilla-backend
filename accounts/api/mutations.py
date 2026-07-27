@@ -1,3 +1,5 @@
+import logging
+
 import strawberry
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
@@ -11,6 +13,8 @@ from accounts.security import require_authenticated_user
 from .types import AuthPayload, TokenPayload, UserType
 
 User = get_user_model()
+
+logger = logging.getLogger(__name__)
 
 
 @strawberry.type
@@ -158,18 +162,32 @@ class AuthMutation:
                 f"{settings.FRONTEND_URL.rstrip('/')}"
                 f"/reset-password?uid={uid}&token={token}"
             )
-            send_mail(
-                subject="Reset your MyVilla password",
-                message=(
-                    "We received a request to reset your MyVilla password.\n\n"
-                    f"Reset it here: {link}\n\n"
-                    "This link is active for 15 minutes. If you didn't request "
-                    "it, you can safely ignore this email."
-                ),
-                from_email=settings.DEFAULT_FROM_EMAIL,
-                recipient_list=[user.email],
-                fail_silently=True,
-            )
+            # fail_silently=False so a real SMTP failure is raised and logged
+            # (e.g. missing prod EMAIL_* config → console backend, or bad Gmail
+            # app password). We still swallow it here and return True: the
+            # response must not reveal whether the address is registered, and a
+            # transient mail-server hiccup shouldn't 500 the caller. The
+            # exception lands in the server log so the failure is diagnosable
+            # instead of vanishing.
+            try:
+                send_mail(
+                    subject="Reset your MyVilla password",
+                    message=(
+                        "We received a request to reset your MyVilla password.\n\n"
+                        f"Reset it here: {link}\n\n"
+                        "This link is active for 15 minutes. If you didn't request "
+                        "it, you can safely ignore this email."
+                    ),
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[user.email],
+                    fail_silently=False,
+                )
+            except Exception:
+                logger.exception(
+                    "Password-reset email failed to send (backend=%s, host=%s)",
+                    settings.EMAIL_BACKEND,
+                    settings.EMAIL_HOST or "(unset → console)",
+                )
         return True
 
     @strawberry.mutation

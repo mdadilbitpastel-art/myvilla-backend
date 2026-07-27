@@ -53,8 +53,10 @@ services:
         value: "31536000"
       - key: SECURE_HSTS_INCLUDE_SUBDOMAINS
         value: "True"
+      # Gmail SMTP requires the From to be the authenticated account, so this
+      # matches EMAIL_HOST_USER below (a different From gets rewritten/rejected).
       - key: DEFAULT_FROM_EMAIL
-        value: "MyVilla <no-reply@myvilla.com>"
+        value: "MyVilla <mdadil.bitpastel@gmail.com>"
       # Google Sign-In. Public OAuth *web* client id — not a secret, and it has
       # to match the frontend's NEXT_PUBLIC_GOOGLE_CLIENT_ID exactly, so it
       # lives here rather than in the dashboard where the two could drift.
@@ -64,10 +66,19 @@ services:
       # Cloudinary: REQUIRED for persistent images (Render disk is ephemeral).
       - key: CLOUDINARY_URL
         sync: false
-      # Email (leave blank → console mode, no real emails sent)
+      # Email / SMTP. Without these the backend falls back to Django's console
+      # backend and NO real mail is sent — that's why password-reset works
+      # locally but not in production. Host/port/user are not secret, so they're
+      # set here as values; only the Gmail App Password is entered by hand in
+      # the dashboard. After setting it, redeploy for the change to take effect.
       - key: EMAIL_HOST
-        sync: false
+        value: "smtp.gmail.com"
+      - key: EMAIL_PORT
+        value: "587"
+      - key: EMAIL_USE_TLS
+        value: "True"
       - key: EMAIL_HOST_USER
-        sync: false
+        value: "mdadil.bitpastel@gmail.com"
+      # The 16-char Gmail App Password — SECRET, set in the Render dashboard.
       - key: EMAIL_HOST_PASSWORD
         sync: false

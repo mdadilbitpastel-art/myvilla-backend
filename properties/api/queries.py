@@ -1,15 +1,27 @@
 from datetime import date, timedelta
+from decimal import Decimal
 from typing import List, Optional
 
 import strawberry
-from django.db.models import Q
+from django.db.models import Avg, Count, Q
+from django.utils import timezone
 from graphql import GraphQLError
 
 from accounts.auth import get_authenticated_user
 from accounts.security import require_authenticated_user
-from properties import availability
-from properties.models import Booking, Favorite, Villa, VillaBlockedDate
-from .types import BookedRangeType, BookingType, VillaAvailabilityType, VillaType
+from properties import availability, coupons as coupon_utils
+from properties.models import Booking, Coupon, Favorite, Review, Villa, VillaBlockedDate
+from .types import (
+    BookedRangeType,
+    BookingType,
+    BookingWindowType,
+    CouponPreviewType,
+    CouponType,
+    OfferType,
+    ReviewType,
+    VillaAvailabilityType,
+    VillaType,
+)
 
 # Fields a free-text search looks at: the villa's own name plus every part of
 # its location, so "villa name, city or country" all work from the one box.
@@ -50,25 +62,58 @@ def _with_availability(
     page and the host's own property list all read the same two fields.
     """
     villas = list(villas)
-    start, end = availability.normalise_range(check_in, check_out)
+
+    # Availability is only judged when the guest actually asked about it — with
+    # dates or a party size. With NO such filter there is nothing to be
+    # "unavailable" for, so every villa is shown plainly (no badge, no reason):
+    # a bare listing page must never accuse a villa of being booked for a stay
+    # nobody searched for.
+    has_dates = check_in is not None
+    has_guests = bool(guests)
+    if not has_dates and not has_guests:
+        return [
+            VillaType.from_model(
+                v,
+                request=request,
+                is_available=True,
+                unavailable_reason="",
+                viewer=viewer,
+            )
+            for v in villas
+        ]
+
     ids = [v.id for v in villas]
-    free_from = availability.booked_until(ids, start, end)
-    blocked = availability.blocked_nights(ids, start, end)
+    # Only look at the calendar when dates were given; a guests-only search must
+    # not pull in date reasons (and vice-versa).
+    if has_dates:
+        start, end = availability.normalise_range(check_in, check_out)
+        free_from = availability.booked_until(ids, start, end)
+        blocked = availability.blocked_nights(ids, start, end)
+    else:
+        end = None
+        free_from = {}
+        blocked = {}
+
     out = []
     for v in villas:
-        reason = availability.unavailable_reason(
+        reasons = availability.unavailable_reasons(
             v,
-            free_from.get(v.id),
-            guests,
-            check_out=end if check_in else None,
-            blocked_on=blocked.get(v.id),
+            guests=guests if has_guests else None,
+            free_from=free_from.get(v.id) if has_dates else None,
+            # Only when the guest named a check-in date: this is what catches a
+            # date that has slipped behind the villa's check-in time.
+            check_in=check_in if has_dates else None,
+            check_out=end if has_dates else None,
+            blocked_on=blocked.get(v.id) if has_dates else None,
         )
         out.append(
             VillaType.from_model(
                 v,
                 request=request,
-                is_available=not reason,
-                unavailable_reason=reason,
+                is_available=not reasons,
+                # All applicable reasons together, so a stay that's both too big
+                # a party AND booked shows both, not just the first.
+                unavailable_reason=" · ".join(reasons),
                 viewer=viewer,
             )
         )
@@ -157,12 +202,70 @@ class PropertyQuery:
         user = require_authenticated_user(info)
         bookings = (
             Booking.objects.filter(guest=user)
-            .select_related("villa", "guest")
+            .select_related("villa", "guest", "villa__owner", "review")
             .prefetch_related("villa__images")
             .order_by("-created_at")
         )
         request = info.context.request
         return [BookingType.from_model(b, request=request) for b in bookings]
+
+    @strawberry.field
+    def pending_review_booking(
+        self, info: strawberry.Info
+    ) -> Optional[BookingType]:
+        """
+        The current guest's oldest completed-but-unreviewed stay, or null. Drives
+        the "rate your stay" popup shown on the landing page. Public-safe: returns
+        null when signed out rather than erroring.
+        """
+        user = get_authenticated_user(info)
+        if user is None:
+            return None
+        booking = (
+            Booking.objects.filter(
+                guest=user, checked_out_at__isnull=False, review__isnull=True
+            )
+            .exclude(status=Booking.STATUS_CANCELLED)
+            .select_related("villa", "guest", "villa__owner", "review")
+            .prefetch_related("villa__images")
+            .order_by("checked_out_at")
+            .first()
+        )
+        if booking is None:
+            return None
+        return BookingType.from_model(booking, request=info.context.request)
+
+    @strawberry.field
+    def villa_reviews(
+        self, info: strawberry.Info, villa_id: strawberry.ID, limit: int = 50
+    ) -> List[ReviewType]:
+        """Public: the reviews left on one villa, newest first."""
+        viewer = get_authenticated_user(info)
+        limit = max(1, min(limit, 100))
+        reviews = (
+            Review.objects.filter(villa_id=villa_id)
+            .select_related("guest", "villa")
+            .order_by("-created_at")[:limit]
+        )
+        return [ReviewType.from_model(r, viewer=viewer) for r in reviews]
+
+    @strawberry.field
+    def latest_reviews(
+        self, info: strawberry.Info, limit: int = 24
+    ) -> List[ReviewType]:
+        """
+        Public: the most recent reviews across ALL villas that carry written
+        text — for the landing-page testimonials. Empty-comment ratings are left
+        out (a testimonial card needs something to say).
+        """
+        viewer = get_authenticated_user(info)
+        limit = max(1, min(limit, 60))
+        reviews = (
+            Review.objects.exclude(comment="")
+            .select_related("guest", "villa")
+            .order_by("-created_at")[:limit]
+        )
+        return [ReviewType.from_model(r, viewer=viewer) for r in reviews]
 
     @strawberry.field
     def my_villa_bookings(self, info: strawberry.Info) -> List[BookingType]:
@@ -173,7 +276,7 @@ class PropertyQuery:
         user = require_authenticated_user(info)
         bookings = (
             Booking.objects.filter(villa__owner=user)
-            .select_related("villa", "guest")
+            .select_related("villa", "guest", "villa__owner", "review")
             .prefetch_related("villa__images")
             .order_by("-created_at")
         )
@@ -186,10 +289,136 @@ class PropertyQuery:
         user = require_authenticated_user(info)
         villas = (
             Villa.objects.filter(favorited_by__user=user)
-            .prefetch_related("images")
+            .select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images")
             .order_by("-favorited_by__created_at")
         )
         return _with_availability(villas, info.context.request, viewer=user)
+
+    @strawberry.field
+    def my_villas_count(self, info: strawberry.Info) -> int:
+        """
+        How many villas the current user owns. Cheap enough to call from the
+        account sidebar on every page: the host-only sections (Rent Requests,
+        Coupons) appear only once this is at least 1, and hide again the moment
+        the last property is removed.
+        """
+        user = require_authenticated_user(info)
+        return Villa.objects.filter(owner=user).count()
+
+    @strawberry.field
+    def my_coupons(self, info: strawberry.Info) -> List[CouponType]:
+        """Discount codes the current user has created. Newest first."""
+        user = require_authenticated_user(info)
+        coupons = (
+            Coupon.objects.filter(owner=user)
+            .select_related("villa")
+            .order_by("-created_at")
+        )
+        return [CouponType.from_model(c) for c in coupons]
+
+    @strawberry.field
+    def public_offers(self, info: strawberry.Info, limit: int = 8) -> List[OfferType]:
+        """
+        Public: live offers for the landing page — real villas paired with an
+        active coupon that applies to them. A villa-scoped coupon shows that
+        villa; a common coupon shows the owner's newest villa as a stand-in.
+        At most one offer per villa, newest coupon first.
+        """
+        limit = max(1, min(limit, 24))
+        request = info.context.request
+        offers: List[OfferType] = []
+        seen_villas = set()
+
+        # Live today: switched on AND inside its validity period. A code the
+        # home page advertises has to be one the guest can actually redeem —
+        # a scheduled or expired coupon must never reach an offer card.
+        today = timezone.localdate()
+        coupons = (
+            Coupon.objects.filter(active=True)
+            .filter(Q(valid_from__isnull=True) | Q(valid_from__lte=today))
+            .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=today))
+            .select_related("villa")
+            .order_by("-created_at")
+        )
+        # Cache each owner's representative (newest) villa for their common coupons.
+        rep_cache: dict = {}
+        for coupon in coupons:
+            if coupon.villa_id is not None:
+                villa = coupon.villa
+            else:
+                if coupon.owner_id not in rep_cache:
+                    rep_cache[coupon.owner_id] = (
+                        Villa.objects.filter(owner_id=coupon.owner_id)
+                        .select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images")
+                        .order_by("-created_at")
+                        .first()
+                    )
+                villa = rep_cache[coupon.owner_id]
+            if villa is None or villa.id in seen_villas:
+                continue
+            seen_villas.add(villa.id)
+            offers.append(OfferType.from_pair(villa, coupon, request=request))
+            if len(offers) >= limit:
+                break
+        return offers
+
+    @strawberry.field
+    def validate_coupon(
+        self,
+        info: strawberry.Info,
+        code: str,
+        villa_id: strawberry.ID,
+        nights: int = 1,
+    ) -> CouponPreviewType:
+        """
+        Public: the payment page's live preview of a code against a villa and a
+        night count. Returns whether it applies and, if so, the amount off this
+        stay's accommodation subtotal (the same figure the booking will freeze).
+        """
+        villa = Villa.objects.filter(pk=villa_id).first()
+        if villa is None:
+            return CouponPreviewType(
+                valid=False,
+                message="Villa not found.",
+                code=coupon_utils.normalise_code(code),
+                discount_type="",
+                discount_value=0,
+                discount=0,
+                label="",
+            )
+        try:
+            coupon = coupon_utils.resolve_coupon(code, villa)
+        except coupon_utils.CouponError as exc:
+            return CouponPreviewType(
+                valid=False,
+                message=str(exc),
+                code=coupon_utils.normalise_code(code),
+                discount_type="",
+                discount_value=0,
+                discount=0,
+                label="",
+            )
+        if coupon is None:
+            return CouponPreviewType(
+                valid=False,
+                message="Enter a coupon code.",
+                code="",
+                discount_type="",
+                discount_value=0,
+                discount=0,
+                label="",
+            )
+        subtotal = Decimal(str(villa.price_per_night)) * max(1, nights)
+        amount = coupon_utils.discount_for(coupon, subtotal)
+        return CouponPreviewType(
+            valid=True,
+            message=f"{coupon_utils.label_for(coupon)} applied.",
+            code=coupon.code,
+            discount_type=coupon.discount_type,
+            discount_value=float(coupon.discount_value),
+            discount=float(amount),
+            label=coupon_utils.label_for(coupon),
+        )
 
     @strawberry.field
     def my_villas(self, info: strawberry.Info) -> List[VillaType]:
@@ -201,7 +430,7 @@ class PropertyQuery:
         user = require_authenticated_user(info)
         villas = (
             Villa.objects.filter(owner=user)
-            .prefetch_related("images")
+            .select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images")
             .order_by("-created_at")
         )
         return _with_availability(villas, info.context.request, viewer=user)
@@ -226,6 +455,23 @@ class PropertyQuery:
         if villa is None:
             raise GraphQLError("Villa not found.")
         return build_villa_availability(villa, days)
+
+    @strawberry.field
+    def booking_window(
+        self, info: strawberry.Info, villa_id: strawberry.ID
+    ) -> BookingWindowType:
+        """
+        Public: the dates a guest may pick for this villa — the host's rolling
+        window plus the dates inside it that are already taken or closed.
+
+        Public on purpose, and deliberately thinner than `villaAvailability`:
+        this names no guests and reveals nothing beyond "you can't have that
+        night", which is exactly what the reservation calendar has to know.
+        """
+        villa = Villa.objects.filter(pk=villa_id).first()
+        if villa is None:
+            raise GraphQLError("Villa not found.")
+        return BookingWindowType.from_model(villa)
 
     @strawberry.field
     def villas(
@@ -255,7 +501,7 @@ class PropertyQuery:
         - `min_price` / `max_price` price-per-night range
         """
         limit = max(1, min(limit, 60))
-        qs = Villa.objects.prefetch_related("images")
+        qs = Villa.objects.select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images")
 
         condition = _search_filter(search)
         if condition is not None:
@@ -296,7 +542,7 @@ class PropertyQuery:
         Public: a single villa by id (used by the detail page). Pass the dates
         and party size to have its availability answered for that exact stay.
         """
-        v = Villa.objects.prefetch_related("images").filter(pk=id).first()
+        v = Villa.objects.select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images").filter(pk=id).first()
         if v is None:
             return None
         return _with_availability(
