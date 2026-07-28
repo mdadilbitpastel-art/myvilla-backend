@@ -21,6 +21,7 @@ from .types import (
     ReviewType,
     VillaAvailabilityType,
     VillaType,
+    WelcomeOfferType,
 )
 
 # Fields a free-text search looks at: the villa's own name plus every part of
@@ -455,6 +456,18 @@ class PropertyQuery:
         if villa is None:
             raise GraphQLError("Villa not found.")
         return build_villa_availability(villa, days)
+
+    @strawberry.field
+    def welcome_offer(self, info: strawberry.Info) -> WelcomeOfferType:
+        """
+        Public: the first-booking welcome offer for whoever is asking.
+
+        Answers for signed-out visitors too — they haven't booked either, and
+        the offer exists to bring them in. `createBooking` re-checks eligibility
+        under a lock before it applies anything, so this is only ever what to
+        show, never what to charge.
+        """
+        return WelcomeOfferType.for_viewer(get_authenticated_user(info))
 
     @strawberry.field
     def booking_window(

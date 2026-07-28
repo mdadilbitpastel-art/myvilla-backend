@@ -79,10 +79,15 @@ class Villa(models.Model):
     # --- Payment Method ---
     # Which methods guests may pay with (Mastercard, Visa, PayPal, Google Pay).
     accepted_payments = models.JSONField(default=list, blank=True)
-    # The host's payout account. payout_account is stored MASKED (last 4 only);
-    # full card numbers are never persisted.
-    payout_method = models.CharField(max_length=60, blank=True)  # Credit / Debit Card
-    payout_account = models.CharField(max_length=64, blank=True)
+    # The host's BANK PAYOUT details (where their earnings would be paid). The
+    # account NUMBER is stored MASKED (last 4 only) — the full number is never
+    # persisted. `payout_method` is legacy (used to hold "Credit/Debit Card");
+    # kept for old rows and now just labelled "Bank Account".
+    payout_account_name = models.CharField(max_length=120, blank=True)
+    payout_bank_name = models.CharField(max_length=120, blank=True)
+    payout_ifsc = models.CharField(max_length=20, blank=True)
+    payout_account = models.CharField(max_length=64, blank=True)  # masked acct no.
+    payout_method = models.CharField(max_length=60, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -100,8 +105,9 @@ class Villa(models.Model):
 
     @property
     def cover_image_url(self) -> str:
-        first = self.images.first()
-        return first.image.url if first else ""
+        # The host-flagged cover, or the first image when none is flagged.
+        cover = self.images.filter(is_cover=True).first() or self.images.first()
+        return cover.image.url if cover else ""
 
 
 class Booking(models.Model):
@@ -154,6 +160,12 @@ class Booking(models.Model):
     # what this guest actually paid never does. 0 / "" when no coupon was used.
     discount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     coupon_code = models.CharField(max_length=32, blank=True)
+    # Set when `discount` came from the platform's first-booking welcome offer
+    # rather than a host's coupon. The two never both apply (see
+    # properties/welcome.py), so this and `coupon_code` are mutually exclusive —
+    # it's what lets a receipt say "First booking · 25% off" instead of naming a
+    # code that was never used.
+    first_booking_discount = models.BooleanField(default=False)
     service_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     # Flat tax on the accommodation subtotal. Bookings taken before tax existed
     # keep 0, so their frozen total stays exactly what the guest agreed to.
@@ -340,11 +352,17 @@ class VillaImage(models.Model):
 
     villa = models.ForeignKey(Villa, on_delete=models.CASCADE, related_name="images")
     image = models.ImageField(upload_to="villas/")
+    # Display order (upload order). Ties break by id.
+    sort_order = models.PositiveIntegerField(default=0)
+    # The cover photo — a FLAG, independent of position, so choosing a cover
+    # never reorders the gallery. At most one per villa is True; falls back to
+    # the first image when none is set.
+    is_cover = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = "properties_villa_image"
-        ordering = ["id"]
+        ordering = ["sort_order", "id"]
 
     def __str__(self):
         return f"Image for villa {self.villa_id}"

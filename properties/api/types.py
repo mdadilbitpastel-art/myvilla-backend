@@ -21,6 +21,8 @@ class VillaImageType:
 
     id: strawberry.ID
     url: str
+    # Whether this photo is the villa's cover (host-flagged, position-independent).
+    is_cover: bool = False
 
 
 @strawberry.type
@@ -190,6 +192,45 @@ class VillaAvailabilityType:
 
 
 @strawberry.type
+class WelcomeOfferType:
+    """
+    The first-booking welcome offer, as the popup and the payment page read it.
+
+    `available` is what decides whether to advertise it at all — true for a
+    signed-out visitor too, since they haven't booked either and the whole point
+    is to bring them in. `claimed` separates "you've already had yours" from
+    "we don't know who you are yet", so the popup can stop nagging a guest who
+    has actually booked.
+    """
+
+    available: bool
+    claimed: bool
+    percent_off: float
+    headline: str
+    blurb: str
+    # True when the viewer is signed in — the popup words its button as "Book
+    # now" rather than "Sign in to claim".
+    signed_in: bool
+
+    @classmethod
+    def for_viewer(cls, user) -> "WelcomeOfferType":
+        from properties import welcome
+
+        signed_in = user is not None and getattr(user, "pk", None) is not None
+        # A signed-out visitor is shown the offer; only a guest we can see has
+        # already booked is told they've used it.
+        claimed = signed_in and not welcome.is_eligible(user)
+        return cls(
+            available=not claimed,
+            claimed=claimed,
+            percent_off=welcome.percent_off(),
+            headline=welcome.HEADLINE,
+            blurb=welcome.BLURB,
+            signed_in=signed_in,
+        )
+
+
+@strawberry.type
 class BookingWindowType:
     """
     The dates a guest may actually pick for one villa — the whole answer the
@@ -283,6 +324,10 @@ class VillaType:
     rating: float
     reviews_count: int
     accepted_payments: List[str]
+    # Host's bank payout details. payout_account is the MASKED account number.
+    payout_account_name: str
+    payout_bank_name: str
+    payout_ifsc: str
     payout_method: str
     payout_account: str
     images: List[str]
@@ -318,9 +363,16 @@ class VillaType:
         imgs = list(villa.images.all())
         image_urls = [absolute(im.image.url) for im in imgs]
         photos = [
-            VillaImageType(id=strawberry.ID(str(im.id)), url=absolute(im.image.url))
+            VillaImageType(
+                id=strawberry.ID(str(im.id)),
+                url=absolute(im.image.url),
+                is_cover=im.is_cover,
+            )
             for im in imgs
         ]
+        # The cover is the flagged photo (not necessarily the first), else the
+        # first — matching Villa.cover_image_url.
+        cover = next((p.url for p in photos if p.is_cover), image_urls[0] if image_urls else "")
         owner = villa.owner
         return cls(
             id=strawberry.ID(str(villa.id)),
@@ -366,11 +418,14 @@ class VillaType:
             rating=_villa_rating(villa),
             reviews_count=_villa_review_count(villa),
             accepted_payments=list(villa.accepted_payments or []),
+            payout_account_name=villa.payout_account_name,
+            payout_bank_name=villa.payout_bank_name,
+            payout_ifsc=villa.payout_ifsc,
             payout_method=villa.payout_method,
             payout_account=villa.payout_account,
             images=image_urls,
             photos=photos,
-            cover_image=image_urls[0] if image_urls else "",
+            cover_image=cover,
             created_at=villa.created_at.isoformat(),
             is_available=is_available,
             unavailable_reason=unavailable_reason,
@@ -408,10 +463,20 @@ class VillaInput:
     additional_rules: str = ""
     price_per_night: float = 0
     accepted_payments: List[str] = strawberry.field(default_factory=list)
+    # Host's bank payout details. payout_account is the (full) account number
+    # the server masks before storing.
+    payout_account_name: str = ""
+    payout_bank_name: str = ""
+    payout_ifsc: str = ""
     payout_method: str = ""
     payout_account: str = ""
     # Images as base64 data-URLs ("data:image/...;base64,...") from the client.
     images: List[str] = strawberry.field(default_factory=list)
+    # Unified display order: each entry is an existing image id or "new" for the
+    # next uploaded image. Empty = keep upload order.
+    image_order: List[str] = strawberry.field(default_factory=list)
+    # Which photo (0-based index into the displayed order) is the cover.
+    cover_index: int = 0
 
 
 @strawberry.type
@@ -435,6 +500,9 @@ class BookingType:
     subtotal: float
     discount: float
     coupon_code: str
+    # What `discount` was for, worded for a receipt: a coupon names its code,
+    # the platform's welcome offer names itself. "" when nothing came off.
+    discount_label: str
     service_fee: float
     tax: float
     # Extra services the guest chose (name + per-night price) and their summed
@@ -461,6 +529,15 @@ class BookingType:
     # dates), ISO-8601. What "late" / "no-show" are measured against.
     check_in_at: str
     check_out_at: str
+    # The server's own wall clock when this was answered, same naive form as
+    # check_in_at/check_out_at so the three compare directly.
+    #
+    # The host's check-in button opens at an exact hour, and it is the SERVER
+    # that decides when — the browser may sit in another time zone (this
+    # deployment runs in UTC), so a button judged on the browser's clock would
+    # unlock hours early or late. The page advances this stamp by however long
+    # it has been open instead of reading its own clock.
+    server_now: str
     # Derived lifecycle: upcoming / awaiting_checkin / staying / completed /
     # no_show / cancelled — computed live from the clock (see Booking).
     lifecycle_status: str
@@ -530,6 +607,11 @@ class BookingType:
             subtotal=float(booking.subtotal),
             discount=float(booking.discount),
             coupon_code=booking.coupon_code or "",
+            discount_label=(
+                "First booking offer"
+                if booking.first_booking_discount
+                else (booking.coupon_code or "")
+            ),
             service_fee=float(booking.service_fee),
             tax=float(booking.tax),
             extra_services=[
@@ -558,6 +640,9 @@ class BookingType:
             # and stay tz-aware, so they DO localise — that's correct for them.)
             check_in_at=booking.check_in_datetime().replace(tzinfo=None).isoformat(),
             check_out_at=booking.check_out_datetime().replace(tzinfo=None).isoformat(),
+            server_now=timezone.localtime(now).replace(tzinfo=None).isoformat(
+                timespec="seconds"
+            ),
             lifecycle_status=booking.lifecycle_status(now),
             hours_late=booking.hours_late(now),
             can_cancel=booking.can_cancel(now),

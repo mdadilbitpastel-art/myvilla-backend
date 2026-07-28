@@ -22,6 +22,15 @@ class User(AbstractBaseUser, PermissionsMixin):
     # Profile picture stored as a small base64 data-URL (client resizes to ≤512px).
     avatar = models.TextField(blank=True, default="")
 
+    # --- Bank payout details ---
+    # ONE set per host, shared by every villa they list (a host is paid to one
+    # account, not one per property). The account NUMBER is stored MASKED (last
+    # 4 only) — the full number is never persisted.
+    payout_account_name = models.CharField(max_length=120, blank=True)
+    payout_bank_name = models.CharField(max_length=120, blank=True)
+    payout_ifsc = models.CharField(max_length=20, blank=True)
+    payout_account = models.CharField(max_length=64, blank=True)
+
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
 

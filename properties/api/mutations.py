@@ -8,8 +8,10 @@ from django.db import transaction
 from django.utils import timezone
 from graphql import GraphQLError
 
+from django.contrib.auth import get_user_model
+
 from accounts.security import require_authenticated_user
-from properties import availability, coupons as coupon_utils, whatsapp
+from properties import availability, coupons as coupon_utils, welcome, whatsapp
 from properties.images import data_url_to_file
 from properties.models import (
     Booking,
@@ -162,12 +164,14 @@ def _validate_common(user, data: VillaInput):
     if data.price_per_night is None or data.price_per_night <= 0:
         raise GraphQLError("Please enter a valid price per night.")
 
-    # --- Section 6: Payment method + account type ---
+    # --- Section 6: Accepted methods + the host's (shared) bank payout ---
     accepted = [p.strip() for p in (data.accepted_payments or []) if p.strip()]
     if not accepted:
         raise GraphQLError("Select at least one payment method.")
-    if not (data.payout_method or "").strip():
-        raise GraphQLError("Please choose Credit or Debit Card.")
+    # Bank details live on the HOST now (one set for all their villas), so a
+    # listing just requires the host to have added them — see updatePayoutDetails.
+    if not (user.payout_account or "").strip():
+        raise GraphQLError("Add your bank account details before listing a property.")
 
     return title, accepted
 
@@ -208,7 +212,7 @@ def _sync_blocked_dates(villa: Villa, raw_dates: List[str]) -> None:
     )
 
 
-def _apply_fields(villa: Villa, data: VillaInput, title, accepted, payout_account):
+def _apply_fields(villa: Villa, data: VillaInput, title, accepted):
     """Copy validated input onto a (new or existing) villa instance."""
     villa.title = title
     villa.property_type = (data.property_type or "").strip()
@@ -237,8 +241,39 @@ def _apply_fields(villa: Villa, data: VillaInput, title, accepted, payout_accoun
     villa.additional_rules = (data.additional_rules or "").strip()
     villa.price_per_night = data.price_per_night
     villa.accepted_payments = accepted
-    villa.payout_method = (data.payout_method or "").strip()
-    villa.payout_account = payout_account
+    # Payout/bank details are stored on the HOST (User), shared by all their
+    # villas — nothing payout-related is written on the villa anymore.
+
+
+def _apply_image_order(image_order, cover_index, kept, new_created):
+    """
+    Set each VillaImage's display order and cover flag.
+
+    `image_order` is a list of tokens — an existing image's id, or "new" for the
+    next freshly-uploaded image (consumed from `new_created` in order) — giving
+    the shown order. `cover_index` is the position IN THAT ORDER that the host
+    picked as the cover (position-independent: choosing a cover never reorders).
+    """
+    by_id = {str(im.id): im for im in kept}
+    new_iter = iter(new_created)
+    order = [str(t).strip() for t in (image_order or [])]
+    if order:
+        ordered, used = [], set()
+        for token in order:
+            im = next(new_iter, None) if token == "new" else by_id.get(token)
+            if im is None or im.pk in used:
+                continue
+            used.add(im.pk)
+            ordered.append(im)
+    else:
+        ordered = list(kept) + list(new_created)
+    if not ordered:
+        return
+    cover = cover_index if 0 <= cover_index < len(ordered) else 0
+    for pos, im in enumerate(ordered):
+        im.sort_order = pos
+        im.is_cover = pos == cover
+        im.save(update_fields=["sort_order", "is_cover"])
 
 
 # Codes are stored upper-cased; this is what a valid one may contain.
@@ -386,20 +421,15 @@ class PropertyMutation:
         if len(images) > MAX_IMAGES:
             raise GraphQLError(f"You can add up to {MAX_IMAGES} images.")
 
-        # --- Card number: a full number is required on create ---
-        if len(_digits(data.payout_account)) < 12:
-            raise GraphQLError("Enter a valid card number.")
-
         files = [data_url_to_file(img) for img in images]
-        payout_account = _mask_account(data.payout_account)
 
         with transaction.atomic():
             villa = Villa(owner=user)
-            _apply_fields(villa, data, title, accepted, payout_account)
+            _apply_fields(villa, data, title, accepted)
             villa.save()
             _sync_blocked_dates(villa, data.blocked_dates)
-            for f in files:
-                VillaImage.objects.create(villa=villa, image=f)
+            new_created = [VillaImage.objects.create(villa=villa, image=f) for f in files]
+            _apply_image_order(data.image_order, data.cover_index, [], new_created)
 
         return VillaType.from_model(villa, request=info.context.request, viewer=user)
 
@@ -425,15 +455,6 @@ class PropertyMutation:
 
         title, accepted = _validate_common(user, data)
 
-        # --- Card number: keep existing unless a new full number is supplied ---
-        incoming = _digits(data.payout_account)
-        if len(incoming) >= 12:
-            payout_account = _mask_account(data.payout_account)
-        elif len(incoming) == 0 and villa.payout_account:
-            payout_account = villa.payout_account  # unchanged
-        else:
-            raise GraphQLError("Enter a valid card number.")
-
         # --- Images: kept existing + newly uploaded, at least one total ---
         keep_ids = {str(i) for i in (keep_image_ids or [])}
         kept = [im for im in villa.images.all() if str(im.id) in keep_ids]
@@ -446,7 +467,7 @@ class PropertyMutation:
         new_files = [data_url_to_file(img) for img in new_images]
 
         with transaction.atomic():
-            _apply_fields(villa, data, title, accepted, payout_account)
+            _apply_fields(villa, data, title, accepted)
             villa.save()
             _sync_blocked_dates(villa, data.blocked_dates)
             # Remove photos the user dropped (delete file + row).
@@ -454,8 +475,10 @@ class PropertyMutation:
                 if str(im.id) not in keep_ids:
                     im.image.delete(save=False)
                     im.delete()
-            for f in new_files:
-                VillaImage.objects.create(villa=villa, image=f)
+            new_created = [VillaImage.objects.create(villa=villa, image=f) for f in new_files]
+            # Order the final set (kept + new) as the host arranged them, so the
+            # chosen cover is first.
+            _apply_image_order(data.image_order, data.cover_index, kept, new_created)
 
         villa.refresh_from_db()
         return VillaType.from_model(villa, request=info.context.request, viewer=user)
@@ -645,15 +668,17 @@ class PropertyMutation:
         chosen_extras = [{"name": c["name"], "price": float(c["price"])} for c in chosen_extras]
 
         # --- Money (frozen server-side) ---
+        # The discount itself is settled inside the transaction below: whether
+        # this is the guest's FIRST booking is a question two concurrent
+        # checkouts could both answer "yes" to, so it is asked with their row
+        # locked. Everything that doesn't depend on it is computed here.
         price = Decimal(str(villa.price_per_night))
         subtotal = _money(price * nights)
-        discount = coupon_utils.discount_for(coupon, subtotal) if coupon else Decimal("0.00")
+        coupon_discount = (
+            coupon_utils.discount_for(coupon, subtotal) if coupon else Decimal("0.00")
+        )
         service_fee = _money(subtotal * SERVICE_FEE_RATE)
         tax = _money(subtotal * TAX_RATE)
-        # Discount comes off the accommodation; fee and tax are on the full
-        # subtotal (mirrors the frontend's computeStayPricing). Extra services
-        # are added straight on top — no fee or tax on them.
-        total = _money(subtotal - discount + service_fee + tax + extras_total)
 
         booking = Booking(
             villa=villa,
@@ -671,13 +696,13 @@ class PropertyMutation:
             check_out_time=villa.check_out_time,
             price_per_night=price,
             subtotal=subtotal,
-            discount=discount,
-            coupon_code=coupon.code if coupon else "",
+            # discount / coupon_code / first_booking_discount / total are all
+            # settled inside the transaction below, once eligibility for the
+            # welcome offer has been decided under a lock.
             service_fee=service_fee,
             tax=tax,
             extra_services=chosen_extras,
             extras_total=extras_total,
-            total=total,
             payment_method=method,
             card_last4=payment_reference,
             billing_street=(data.billing_street or "").strip(),
@@ -721,6 +746,30 @@ class PropertyMutation:
                     "Someone else booked these dates while you were checking out. "
                     "Nothing has been charged — please choose different dates."
                 )
+
+            # --- The discount, settled last ---
+            # "Is this their first booking?" is a question two checkouts open in
+            # two tabs could both answer yes to, so the guest's own row is
+            # locked first: the second one then queues and sees the first
+            # booking already committed. The welcome offer and a host's coupon
+            # do not stack — the guest gets whichever is larger (see welcome.py).
+            get_user_model().objects.select_for_update().filter(pk=user.pk).first()
+            welcome_discount = welcome.discount_for(user, subtotal)
+            winner = welcome.better_of(welcome_discount, coupon_discount)
+
+            booking.first_booking_discount = winner == "welcome"
+            booking.discount = (
+                welcome_discount if winner == "welcome"
+                else coupon_discount if winner == "coupon"
+                else Decimal("0.00")
+            )
+            booking.coupon_code = coupon.code if (coupon and winner == "coupon") else ""
+            # Discount comes off the accommodation; fee and tax are on the full
+            # subtotal (mirrors the frontend's computeStayPricing). Extra
+            # services are added straight on top — no fee or tax on them.
+            booking.total = _money(
+                subtotal - booking.discount + service_fee + tax + extras_total
+            )
 
             booking.save()
 
@@ -771,8 +820,8 @@ class PropertyMutation:
     def check_in_booking(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
         """
         Host marks the guest as arrived on a booking for a villa they own.
-        Records the moment now. Owner-only; can't check in a cancelled stay or
-        one already checked in.
+        Records the moment now. Owner-only; can't check in a cancelled stay,
+        one already checked in, or one whose check-in hour hasn't arrived.
         """
         user = require_authenticated_user(info)
         booking = (
@@ -786,7 +835,24 @@ class PropertyMutation:
             raise GraphQLError("This booking was cancelled.")
         if booking.checked_in_at is not None:
             raise GraphQLError("This guest is already checked in.")
-        booking.checked_in_at = timezone.now()
+
+        # A stay can't begin before it begins. Measured against THIS booking's
+        # own check-in time — the snapshot taken when it was made (see
+        # Booking.scheduled_check_in_time) — so a host who later re-times the
+        # villa can't move the hour a guest already booked against, in either
+        # direction. The button is disabled until then; this is the gate behind
+        # it, for a stale page or a hand-made request.
+        now = timezone.now()
+        opens = booking.check_in_datetime()
+        if now < opens:
+            local = timezone.localtime(opens)
+            raise GraphQLError(
+                "Check-in for this booking opens "
+                f"{local.strftime('%d %b %Y')} at "
+                f"{local.strftime('%I:%M %p').lstrip('0')}."
+            )
+
+        booking.checked_in_at = now
         booking.save(update_fields=["checked_in_at", "updated_at"])
         return BookingType.from_model(booking, request=info.context.request)
 

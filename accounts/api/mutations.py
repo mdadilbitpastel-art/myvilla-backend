@@ -259,6 +259,50 @@ class AuthMutation:
         return UserType.from_model(user)
 
     @strawberry.mutation
+    def update_payout_details(
+        self,
+        info: strawberry.Info,
+        account_name: str,
+        bank_name: str,
+        account_number: str = "",
+        ifsc: str = "",
+    ) -> UserType:
+        """
+        Save the host's ONE set of bank payout details, shared by every villa
+        they list. The account number is masked (last 4) before storage; leave
+        it blank to keep the existing one. Requires a valid session.
+        """
+        user = require_authenticated_user(info)
+
+        if not account_name.strip():
+            raise GraphQLError("Enter the account holder's name.")
+        if not bank_name.strip():
+            raise GraphQLError("Select your bank.")
+        # IFSC / SWIFT is optional.
+
+        digits = "".join(ch for ch in (account_number or "") if ch.isdigit())
+        if digits:
+            if len(digits) < 8:
+                raise GraphQLError("Enter a valid bank account number.")
+            masked = "•••• " + digits[-4:]
+        elif user.payout_account:
+            masked = user.payout_account  # blank = keep the existing number
+        else:
+            raise GraphQLError("Enter a valid bank account number.")
+
+        user.payout_account_name = account_name.strip()
+        user.payout_bank_name = bank_name.strip()
+        user.payout_ifsc = ifsc.strip().upper()
+        user.payout_account = masked
+        user.save(
+            update_fields=[
+                "payout_account_name", "payout_bank_name",
+                "payout_ifsc", "payout_account", "updated_at",
+            ]
+        )
+        return UserType.from_model(user)
+
+    @strawberry.mutation
     def update_avatar(self, info: strawberry.Info, image: str) -> UserType:
         """
         Set the current user's profile picture. `image` is a base64 data-URL
