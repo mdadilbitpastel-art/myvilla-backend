@@ -32,8 +32,9 @@ from .types import (
     _clean_extra_services,
 )
 
-# Upper bound on images per villa (defensive; the UI allows fewer).
-MAX_IMAGES = 15
+# How many photos one villa may carry. The wizard stops a host at the same
+# number; this is the rule itself, for anything that reaches the API another way.
+MAX_IMAGES = 10
 
 # Platform service fee applied on top of the accommodation subtotal.
 SERVICE_FEE_RATE = Decimal("0.141")
