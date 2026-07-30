@@ -13,7 +13,24 @@ from typing import Dict, Iterable, List, Optional
 
 from django.utils import timezone
 
-from properties.models import DEFAULT_CHECK_IN_TIME, Booking, VillaBlockedDate
+from properties.models import (
+    DEFAULT_CHECK_IN_TIME,
+    Booking,
+    StayHold,
+    VillaBlockedDate,
+)
+
+
+def today_local(now=None) -> date:
+    """
+    Today on the app's own clock (settings.TIME_ZONE), not the process's.
+
+    `date.today()` reads the host's system date, which on a machine running in
+    UTC is a different day from the one `timezone.localtime()` answers with —
+    and every rule below is judged on the latter. Mixing the two is how a villa
+    ends up open on a date the window says has gone.
+    """
+    return (timezone.localtime(now) if now is not None else timezone.localtime()).date()
 
 
 def parse_date(value: Optional[str]) -> Optional[date]:
@@ -40,7 +57,7 @@ def normalise_range(check_in: Optional[date], check_out: Optional[date]):
         return check_in, check_out
     if check_in and not check_out:
         return check_in, check_in + timedelta(days=1)
-    today = date.today()
+    today = today_local()
     return today, today + timedelta(days=1)
 
 
@@ -98,37 +115,151 @@ def window_end(villa, now=None) -> date:
     return last_bookable_date(villa, now) + timedelta(days=1)
 
 
-def unavailable_dates(villa, now=None) -> List[date]:
+def booked_nights(villa_ids: Iterable[int], start: date, end: date) -> Dict[int, set]:
     """
-    Every date inside the window a guest may NOT take: already booked by
-    someone else, or closed by the host. The calendar disables exactly these
-    (everything outside the window is disabled by the window itself).
-    """
-    start = first_bookable_date(villa, now)
-    end = window_end(villa, now)  # exclusive
+    Per villa, the nights active bookings occupy inside [start, end).
 
-    taken = set()
-    ranges = Booking.objects.filter(
-        villa=villa,
+    Goes through each booking's SEGMENTS rather than its outer check_in…
+    check_out, because a split stay does not hold the nights it skipped — those
+    belong to whoever the guest booked around, and they must free up on their
+    own schedule (or when that other booking is cancelled), not on this one's.
+    """
+    ids = [int(i) for i in villa_ids]
+    if not ids:
+        return {}
+    rows = Booking.objects.filter(
+        villa_id__in=ids,
         status=Booking.STATUS_ACTIVE,
         check_in__lt=end,
         check_out__gt=start,
-    ).values_list("check_in", "check_out")
-    for check_in, check_out in ranges:
-        # Half-open: the check-out day is free for the next guest, so it is not
-        # one of the occupied nights.
-        night = max(check_in, start)
-        stop = min(check_out, end)
-        while night < stop:
-            taken.add(night)
-            night += timedelta(days=1)
+    ).only("villa_id", "check_in", "check_out", "segments")
 
+    nights: Dict[int, set] = {}
+    for booking in rows:
+        held = nights.setdefault(int(booking.villa_id), set())
+        for night in booking.occupied_nights():
+            # Half-open: the check-out day is free for the next guest, so it is
+            # not one of the occupied nights (occupied_nights already stops
+            # short of it) — this only clips to the window being asked about.
+            if start <= night < end:
+                held.add(night)
+    return nights
+
+
+def held_nights(villa, start: date, end: date, for_guest=None, now=None) -> set:
+    """
+    Nights in [start, end) another guest has taken off the market while they
+    pay for them (see StayHold).
+
+    `for_guest` is the person ASKING, and their own hold never counts against
+    them: it exists precisely so they can finish paying for those nights, and
+    treating it as a clash would make a guest lose a race against themselves.
+    Expired, released and already-converted holds are all long gone.
+    """
+    rows = StayHold.objects.filter(
+        villa=villa,
+        released_at__isnull=True,
+        booking__isnull=True,
+        expires_at__gt=(now or timezone.now()),
+        check_in__lt=end,
+        check_out__gt=start,
+    ).only("check_in", "check_out", "segments", "guest_id")
+
+    nights = set()
+    for hold in rows:
+        if for_guest is not None and hold.guest_id == getattr(for_guest, "id", None):
+            continue
+        nights.update(n for n in hold.occupied_nights() if start <= n < end)
+    return nights
+
+
+def taken_nights(villa, start: date, end: date, for_guest=None, now=None) -> set:
+    """
+    Every night in [start, end) this villa cannot be slept in: held by an
+    active booking, closed by the host, or on hold while somebody else pays.
+    The one set both the calendar and the stay-splitter are built on.
+    """
+    taken = set(booked_nights([villa.pk], start, end).get(int(villa.pk), set()))
     taken.update(
         VillaBlockedDate.objects.filter(
             villa=villa, date__gte=start, date__lt=end
         ).values_list("date", flat=True)
     )
-    return sorted(taken)
+    taken.update(held_nights(villa, start, end, for_guest=for_guest, now=now))
+    return taken
+
+
+def unavailable_dates(villa, now=None, for_guest=None) -> List[date]:
+    """
+    Every date inside the window a guest may NOT take: already booked by
+    someone else, closed by the host, or held while someone else pays. The
+    calendar disables exactly these (everything outside the window is disabled
+    by the window itself).
+    """
+    return sorted(
+        taken_nights(
+            villa,
+            first_bookable_date(villa, now),
+            window_end(villa, now),
+            for_guest=for_guest,
+        )
+    )
+
+
+# --------------------------------------------------------------------------
+# Splitting a stay around nights somebody else holds
+#
+# A clash in the middle of a range no longer refuses the whole range. The villa
+# is genuinely free either side of it, so the stay simply breaks in two: the
+# guest checks out the morning the other booking starts and checks back in the
+# morning it ends. Only the nights they actually sleep are charged.
+#
+#   want 29 Jul → 2 Aug, 30 & 31 Jul taken
+#     →  29 Jul → 30 Jul   (1 night)
+#        1 Aug  → 2 Aug    (1 night)
+#        30, 31 Jul skipped, and not paid for
+# --------------------------------------------------------------------------
+
+
+def split_stay(villa, check_in: date, check_out: date, for_guest=None):
+    """
+    Break [check_in, check_out) into the runs of nights this villa can actually
+    take, in order.
+
+    Returns `(segments, skipped)` — segments as (check_in, check_out) pairs,
+    skipped as the sorted nights that were dropped. An empty `segments` means
+    nothing in the range is free at all, which is the only case the caller has
+    to refuse.
+
+    `for_guest` is who is asking: their own payment hold doesn't count against
+    them, so the guest who reserved these nights is the one who can still take
+    them (see `held_nights`).
+    """
+    if check_out <= check_in:
+        return [], []
+
+    taken = taken_nights(villa, check_in, check_out, for_guest=for_guest)
+
+    segments = []
+    run_start = None
+    night = check_in
+    while night < check_out:
+        if night in taken:
+            if run_start is not None:
+                segments.append((run_start, night))
+                run_start = None
+        elif run_start is None:
+            run_start = night
+        night += timedelta(days=1)
+    if run_start is not None:
+        segments.append((run_start, check_out))
+
+    return segments, sorted(taken)
+
+
+def segment_nights(segments) -> int:
+    """How many nights a list of (check_in, check_out) runs adds up to."""
+    return sum((end - start).days for start, end in segments)
 
 
 def booked_until(
@@ -146,18 +277,24 @@ def booked_until(
     ids = [int(i) for i in villa_ids]
     if not ids:
         return {}
-    clashing = Booking.objects.filter(
+    candidates = Booking.objects.filter(
         villa_id__in=ids,
         status=Booking.STATUS_ACTIVE,
         check_in__lt=check_out,
         check_out__gt=check_in,
-    ).values_list("villa_id", "check_out")
+    ).only("villa_id", "check_in", "check_out", "segments")
 
     free_from: Dict[int, date] = {}
-    for villa_id, ends in clashing:
-        villa_id = int(villa_id)
-        if ends > free_from.get(villa_id, ends - timedelta(days=1)):
-            free_from[villa_id] = ends
+    for booking in candidates:
+        villa_id = int(booking.villa_id)
+        # A split stay's outer dates can bracket nights it doesn't hold, so the
+        # clash is judged segment by segment: one whose gap is what we're asking
+        # about isn't a clash at all, and the villa frees up at the end of the
+        # LAST segment that really does overlap — not at the stay's own end.
+        for starts, ends in booking.stay_segments():
+            if starts < check_out and ends > check_in:
+                if ends > free_from.get(villa_id, ends - timedelta(days=1)):
+                    free_from[villa_id] = ends
     return free_from
 
 

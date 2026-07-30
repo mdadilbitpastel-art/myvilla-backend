@@ -11,9 +11,16 @@ from graphql import GraphQLError
 from django.contrib.auth import get_user_model
 
 from accounts.security import require_authenticated_user
-from properties import availability, coupons as coupon_utils, welcome, whatsapp
+from properties import (
+    availability,
+    checkin,
+    coupons as coupon_utils,
+    welcome,
+    whatsapp,
+)
 from properties.images import data_url_to_file
 from properties.models import (
+    DEFAULT_GRACE_MINUTES,
     Booking,
     Coupon,
     Favorite,
@@ -62,6 +69,14 @@ def _digits(raw: str) -> str:
     return "".join(ch for ch in (raw or "") if ch.isdigit())
 
 
+def _segments_json(segments) -> list:
+    """A split stay's (check_in, check_out) runs, as the JSON the column holds."""
+    return [
+        {"check_in": start.isoformat(), "check_out": end.isoformat()}
+        for start, end in segments
+    ]
+
+
 def _mask_account(raw: str) -> str:
     """Store payout accounts safely: keep only the last 4 digits, masked."""
     account = (raw or "").strip()
@@ -108,6 +123,28 @@ def _parse_time(value: str, label: str):
         return datetime.strptime(text[:5], "%H:%M").time()
     except ValueError:
         raise GraphQLError(f"Enter a valid {label} time.")
+
+
+def _owned_booking(info, id) -> Booking:
+    """
+    The caller's own booking, or a refusal. Shared by the check-in steps.
+
+    Module-level, not a method: inside a Strawberry resolver `self` is the root
+    value — which for a root mutation is None — so `self._helper(...)` fails
+    with "'NoneType' object has no attribute ...". Resolvers only ever share
+    code through plain functions like this one.
+    """
+    user = require_authenticated_user(info)
+    booking = (
+        Booking.objects.select_related("villa", "guest", "villa__owner", "review")
+        .filter(pk=id, villa__owner=user)
+        .first()
+    )
+    if booking is None:
+        raise GraphQLError("Booking not found.")
+    if booking.status == Booking.STATUS_CANCELLED:
+        raise GraphQLError("This booking was cancelled.")
+    return booking
 
 
 def _validate_common(user, data: VillaInput):
@@ -186,7 +223,7 @@ def _sync_blocked_dates(villa: Villa, raw_dates: List[str]) -> None:
     rather than rejected — the host didn't put it there, the calendar shows it
     as booked, and failing the whole save over it would help nobody.
     """
-    today = date.today()
+    today = availability.today_local()
     wanted = set()
     for raw in raw_dates or []:
         try:
@@ -236,6 +273,12 @@ def _apply_fields(villa: Villa, data: VillaInput, title, accepted):
     villa.extra_services = _clean_extra_services(data.extra_services)
     villa.check_in_time = _parse_time(data.check_in_time, "check-in")
     villa.check_out_time = _parse_time(data.check_out_time, "check-out")
+    # How long a late guest may still be checked in. 0 (the input's default,
+    # i.e. the host didn't say) keeps the platform's standard window rather
+    # than meaning "no grace at all", which would make every late arrival an
+    # instant no-show for hosts who never opened that field.
+    grace = int(data.grace_period_minutes or 0)
+    villa.grace_period_minutes = grace if grace > 0 else DEFAULT_GRACE_MINUTES
     villa.pets_allowed = bool(data.pets_allowed)
     villa.smoking_allowed = bool(data.smoking_allowed)
     villa.events_allowed = bool(data.events_allowed)
@@ -543,10 +586,9 @@ class PropertyMutation:
             check_out = date.fromisoformat((data.check_out or "").strip())
         except ValueError:
             raise GraphQLError("Please choose valid check-in and check-out dates.")
-        nights = (check_out - check_in).days
-        if nights < 1:
+        if (check_out - check_in).days < 1:
             raise GraphQLError("Check-out must be after check-in.")
-        if nights > MAX_BOOKING_NIGHTS:
+        if (check_out - check_in).days > MAX_BOOKING_NIGHTS:
             raise GraphQLError(
                 f"You can book at most {MAX_BOOKING_NIGHTS} nights per stay."
             )
@@ -560,7 +602,7 @@ class PropertyMutation:
         last_open = availability.last_bookable_date(villa)
         cutoff = availability.check_in_cutoff(villa).strftime("%I:%M %p").lstrip("0")
         if check_in < first_open:
-            if check_in < date.today():
+            if check_in < availability.today_local():
                 raise GraphQLError("Check-in date cannot be in the past.")
             # Today, but the door has already closed on it.
             raise GraphQLError(
@@ -577,6 +619,36 @@ class PropertyMutation:
                 f"This villa is only open for bookings up to "
                 f"{last_open.strftime('%d %b %Y')}. Please shorten your stay."
             )
+
+        # --- The stay, split around nights somebody else holds ---
+        # A clash in the middle no longer refuses the whole range: the villa is
+        # free either side of it, so the stay breaks into runs and only the
+        # nights actually slept are charged (see availability.split_stay). The
+        # split is settled again inside the transaction below — this one is
+        # what the guest is quoted, that one is what they're charged.
+        segments, _ = availability.split_stay(villa, check_in, check_out)
+        if not segments:
+            raise GraphQLError(
+                "Every night in those dates is already taken. "
+                "Please choose different dates."
+            )
+        nights = availability.segment_nights(segments)
+
+        # The page priced a specific number of nights before the guest typed a
+        # card number. If availability moved since — someone cancelled and freed
+        # nights the split would now swallow up — the stay in front of them is
+        # not the one they agreed to, so it is re-quoted rather than charged.
+        if data.expected_nights and data.expected_nights != nights:
+            raise GraphQLError(
+                "These dates changed while you were checking out — the stay is "
+                f"now {nights} night{'' if nights == 1 else 's'}, not "
+                f"{data.expected_nights}. Nothing has been charged — please "
+                "check the dates and try again."
+            )
+
+        # The outer bounds bracket the runs: the guest arrives at the first and
+        # finally leaves at the last, whatever they skipped in between.
+        check_in, check_out = segments[0][0], segments[-1][1]
 
         # --- Guests: the villa's stated capacity is a hard cap ---
         guests = max(1, data.guests)
@@ -687,6 +759,9 @@ class PropertyMutation:
             check_in=check_in,
             check_out=check_out,
             nights=nights,
+            # Only a broken stay carries its runs; an unbroken one is fully
+            # described by the two dates above (see Booking.stay_segments).
+            segments=_segments_json(segments) if len(segments) > 1 else [],
             guests=guests,
             # Frozen villa snapshot — these must not change if the host later
             # edits the listing (see Booking).
@@ -695,6 +770,7 @@ class PropertyMutation:
             villa_country=villa.country,
             check_in_time=villa.check_in_time,
             check_out_time=villa.check_out_time,
+            grace_period_minutes=villa.grace_period_minutes,
             price_per_night=price,
             subtotal=subtotal,
             # discount / coupon_code / first_booking_discount / total are all
@@ -735,14 +811,21 @@ class PropertyMutation:
                     "charged — please pick new dates."
                 )
 
-            blocked_on = availability.is_blocked(villa.pk, check_in, check_out)
-            if blocked_on:
-                raise GraphQLError(
-                    f"The host has just closed {blocked_on.strftime('%d %b %Y')}. "
-                    "Nothing has been charged — please choose different dates."
-                )
-
-            if availability.is_booked(villa.pk, check_in, check_out):
+            # The split, settled for real. Re-derived under the villa's lock so
+            # two checkouts racing for the same nights can't both take them —
+            # and compared against what was quoted above, because a stay whose
+            # nights moved is not the stay the guest agreed to pay for.
+            final_segments, _ = availability.split_stay(villa, check_in, check_out)
+            if final_segments != segments:
+                # Name the host's own closure when that's what moved, since
+                # "someone else booked it" would be wrong and unactionable.
+                for starts, ends in segments:
+                    closed = availability.is_blocked(villa.pk, starts, ends)
+                    if closed:
+                        raise GraphQLError(
+                            f"The host has just closed {closed.strftime('%d %b %Y')}. "
+                            "Nothing has been charged — please choose different dates."
+                        )
                 raise GraphQLError(
                     "Someone else booked these dates while you were checking out. "
                     "Nothing has been charged — please choose different dates."
@@ -789,10 +872,13 @@ class PropertyMutation:
     @strawberry.mutation
     def cancel_booking(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
         """
-        Cancel one of the current user's own bookings. Refused once the host has
-        checked the guest in — a stay under way can't be called off. A late
-        cancellation (inside the free window) carries a fine, computed and
-        frozen here so what the guest is charged doesn't drift as time passes.
+        Cancel one of the current user's own bookings.
+
+        The flexible cancellation policy decides both whether this is still
+        allowed and what it costs (see Booking.cancellation_policy): free before
+        the check-in day, a 50% charge on the day itself, and refused from the
+        check-in time onward. The penalty is frozen onto the row here, so what
+        the guest was charged doesn't drift as the clock moves on.
         """
         user = require_authenticated_user(info)
         booking = (
@@ -802,14 +888,14 @@ class PropertyMutation:
         )
         if booking is None:
             raise GraphQLError("Booking not found.")
-        if booking.status == Booking.STATUS_CANCELLED:
-            raise GraphQLError("This booking is already cancelled.")
-        if booking.checked_in_at is not None:
-            raise GraphQLError(
-                "You're already checked in — this stay can no longer be cancelled."
-            )
         now = timezone.now()
-        booking.cancellation_fee = booking.cancel_fee_at(now)
+        policy = booking.cancellation_policy(now)
+        # One check for every refusal — already cancelled, already checked in,
+        # or past the check-in time — each carrying the policy's own wording, so
+        # the error the guest reads matches the note shown on the booking.
+        if not policy.can_cancel:
+            raise GraphQLError(policy.message)
+        booking.cancellation_fee = policy.penalty_amount
         booking.cancelled_at = now
         booking.status = Booking.STATUS_CANCELLED
         booking.save(
@@ -817,68 +903,134 @@ class PropertyMutation:
         )
         return BookingType.from_model(booking, request=info.context.request)
 
+    # --- Check-in, in two steps ---
+    #
+    # A host cannot check a guest in by pressing a button: pressing it issues a
+    # 4-digit PIN that appears only on the GUEST's booking page, and the host
+    # has to be told it and type it back. So a recorded check-in means the guest
+    # was actually standing there. Both steps are owner-only and both re-read
+    # the check-in window, so a stale page can't slip past the closed gate.
+
     @strawberry.mutation
-    def check_in_booking(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
+    def start_check_in(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
         """
-        Host marks the guest as arrived on a booking for a villa they own.
-        Records the moment now. Owner-only; can't check in a cancelled stay,
-        one already checked in, or one whose check-in hour hasn't arrived.
+        Step 1: issue a check-in PIN for a booking on a villa the caller owns.
+
+        Any PIN this booking already had stops working at that moment, so
+        pressing Check in again after one expires is the recovery path — there
+        is never more than one live code. The digits are NOT in the response:
+        they go to the guest's own booking page, and the host has to ask.
         """
-        user = require_authenticated_user(info)
-        booking = (
-            Booking.objects.select_related("villa", "guest", "villa__owner", "review")
-            .filter(pk=id, villa__owner=user)
-            .first()
-        )
-        if booking is None:
-            raise GraphQLError("Booking not found.")
-        if booking.status == Booking.STATUS_CANCELLED:
-            raise GraphQLError("This booking was cancelled.")
-        if booking.checked_in_at is not None:
+        booking = _owned_booking(info, id)
+        # Per PART, not per booking: a split stay is arrived at more than once,
+        # and each arrival needs its own PIN.
+        if booking.current_part_checked_in_at() is not None:
             raise GraphQLError("This guest is already checked in.")
-
-        # A stay can't begin before it begins. Measured against THIS booking's
-        # own check-in time — the snapshot taken when it was made (see
-        # Booking.scheduled_check_in_time) — so a host who later re-times the
-        # villa can't move the hour a guest already booked against, in either
-        # direction. The button is disabled until then; this is the gate behind
-        # it, for a stale page or a hand-made request.
-        now = timezone.now()
-        opens = booking.check_in_datetime()
-        if now < opens:
-            local = timezone.localtime(opens)
-            raise GraphQLError(
-                "Check-in for this booking opens "
-                f"{local.strftime('%d %b %Y')} at "
-                f"{local.strftime('%I:%M %p').lstrip('0')}."
-            )
-
-        booking.checked_in_at = now
-        booking.save(update_fields=["checked_in_at", "updated_at"])
+        try:
+            checkin.issue_pin(booking, actor=require_authenticated_user(info))
+        except checkin.CheckInError as exc:
+            raise GraphQLError(str(exc))
         return BookingType.from_model(booking, request=info.context.request)
 
     @strawberry.mutation
-    def check_out_booking(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
+    def verify_check_in(
+        self, info: strawberry.Info, id: strawberry.ID, pin: str
+    ) -> BookingType:
         """
-        Host marks the guest as departed. Records the moment now. Owner-only;
-        requires a prior check-in and refuses a second check-out.
+        Step 2: the host types the PIN the guest read out. If it matches a live
+        code, the guest is checked in and the PIN is spent.
+
+        Three wrong tries lock that code and email the guest a security alert;
+        the host can issue a fresh one with `startCheckIn` while the check-in
+        window is still open.
         """
-        user = require_authenticated_user(info)
-        booking = (
-            Booking.objects.select_related("villa", "guest", "villa__owner", "review")
-            .filter(pk=id, villa__owner=user)
-            .first()
-        )
-        if booking is None:
-            raise GraphQLError("Booking not found.")
-        if booking.status == Booking.STATUS_CANCELLED:
-            raise GraphQLError("This booking was cancelled.")
-        if booking.checked_in_at is None:
-            raise GraphQLError("Check the guest in first.")
-        if booking.checked_out_at is not None:
-            raise GraphQLError("This guest is already checked out.")
-        booking.checked_out_at = timezone.now()
-        booking.save(update_fields=["checked_out_at", "updated_at"])
+        booking = _owned_booking(info, id)
+        try:
+            checkin.verify_pin(booking, pin, actor=require_authenticated_user(info))
+        except checkin.CheckInError as exc:
+            raise GraphQLError(str(exc))
+        return BookingType.from_model(booking, request=info.context.request)
+
+    @strawberry.mutation
+    def allow_late_check_in(
+        self, info: strawberry.Info, id: strawberry.ID
+    ) -> BookingType:
+        """
+        Re-open check-in on a no-show, at the host's discretion.
+
+        The guest missed the window, so the booking stays a no-show on the
+        record and the refund stays 0%; this only puts the (still PIN-verified)
+        check-in button back, for the host who decides to take them in anyway.
+        """
+        booking = _owned_booking(info, id)
+        # Per PART, not per booking: a split stay is arrived at more than once,
+        # and each arrival needs its own PIN.
+        if booking.current_part_checked_in_at() is not None:
+            raise GraphQLError("This guest is already checked in.")
+        now = timezone.now()
+        if booking.lifecycle_status(now) != Booking.LIFECYCLE_NO_SHOW:
+            raise GraphQLError(
+                "This booking isn't a no-show — check-in is still open normally."
+            )
+        # The stay itself has run out: there is no longer anything to check the
+        # guest into, so this isn't a decision the host still gets to make.
+        if now >= booking.check_out_datetime():
+            raise GraphQLError(
+                "This stay has ended — the guest never checked in, and check-in "
+                "can't be reopened after the check-out time."
+            )
+        checkin.allow_late_check_in(booking, actor=require_authenticated_user(info), now=now)
+        return BookingType.from_model(booking, request=info.context.request)
+
+    # --- Check-out, in the same two steps ---
+    #
+    # A departure is proved exactly like an arrival: pressing Check out issues a
+    # 4-digit PIN that appears only on the GUEST's booking page, and the host has
+    # to be told it. A host cannot close a stay — and cannot free up the nights a
+    # guest leaves early — without the guest being there to read the code out.
+
+    @strawberry.mutation
+    def start_check_out(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
+        """
+        Step 1: issue a check-out PIN for a booking on a villa the caller owns.
+
+        Refused unless somebody is actually checked in. Any PIN this booking
+        already had stops working at that moment, so pressing Check out again
+        after one expires is the recovery path.
+        """
+        booking = _owned_booking(info, id)
+        try:
+            checkin.issue_pin(
+                booking,
+                purpose=checkin.CHECK_OUT,
+                actor=require_authenticated_user(info),
+            )
+        except checkin.CheckInError as exc:
+            raise GraphQLError(str(exc))
+        return BookingType.from_model(booking, request=info.context.request)
+
+    @strawberry.mutation
+    def verify_check_out(
+        self, info: strawberry.Info, id: strawberry.ID, pin: str
+    ) -> BookingType:
+        """
+        Step 2: the host types the PIN the guest read out, and the stay closes.
+
+        On a split stay this closes the part in front of them — the guest is due
+        back — so the booking is finished only when no part is left. A guest
+        leaving before the hour they booked also hands those nights back to the
+        calendar; no money moves either way (see checkin._record_departure).
+        """
+        booking = _owned_booking(info, id)
+        try:
+            checkin.verify_pin(
+                booking,
+                pin,
+                purpose=checkin.CHECK_OUT,
+                actor=require_authenticated_user(info),
+            )
+        except checkin.CheckInError as exc:
+            raise GraphQLError(str(exc))
         return BookingType.from_model(booking, request=info.context.request)
 
     @strawberry.mutation
@@ -903,11 +1055,29 @@ class PropertyMutation:
             raise GraphQLError("Booking not found.")
         if booking.status == Booking.STATUS_CANCELLED:
             raise GraphQLError("A cancelled booking can't be reviewed.")
-        if booking.checked_out_at is None:
+        # Every part checked out, not merely the booking-level stamp — see the
+        # note on `can_review` in types.py. A split stay the guest is due back
+        # for is not a stay they can rate yet.
+        if not booking.stay_finished:
             raise GraphQLError("You can review a stay once it's completed.")
+        # The parts also run out on a guest who never arrived; there is no stay
+        # there to rate. Mirrors `can_review` in types.py.
+        if not booking.any_part_arrived:
+            raise GraphQLError("You can only review a stay you checked in for.")
         stars = int(rating)
         if stars < Review.RATING_MIN or stars > Review.RATING_MAX:
             raise GraphQLError("Please give a rating between 1 and 5 stars.")
+
+        # Editing closes a day after the review went up. The button is gone by
+        # then; this is the rule behind it, for a stale page or a hand-made
+        # request. A first review is never blocked — only a change to one.
+        existing = Review.objects.filter(booking=booking).first()
+        if existing is not None and not existing.can_edit():
+            raise GraphQLError(
+                f"Reviews can be edited for {Review.EDIT_WINDOW_HOURS} hours after "
+                "they're posted. This one can no longer be changed."
+            )
+
         Review.objects.update_or_create(
             booking=booking,
             defaults={

@@ -208,12 +208,20 @@ def send_booking_confirmation(booking, cover_url: str = "") -> None:
 
     where = ", ".join(x for x in [villa.city, villa.country] if x)
     nights = booking.nights
+    # A stay booked around nights somebody else holds isn't continuous, so its
+    # two outer dates would misdescribe it — each part is named instead. This is
+    # the message the guest keeps on their phone, so it has to be the truth
+    # about when they're actually at the property.
+    runs = booking.stay_segments()
+    when = " + ".join(
+        f"{_fmt_date(start)} to {_fmt_date(end)}" for start, end in runs
+    )
     params = [
         (guest.full_name or guest.email.split("@")[0] or "there").strip(),
         villa.title,
         where,
-        f"{_fmt_date(booking.check_in)} to {_fmt_date(booking.check_out)} "
-        f"({nights} night{'' if nights == 1 else 's'})",
+        f"{when} ({nights} night{'' if nights == 1 else 's'}"
+        f"{f', {len(runs)} parts' if len(runs) > 1 else ''})",
         f"{booking.guests} guest{'' if booking.guests == 1 else 's'}",
         f"${booking.total}",
     ]

@@ -19,6 +19,7 @@ from .types import (
     CouponType,
     OfferType,
     ReviewType,
+    StaySegmentType,
     VillaAvailabilityType,
     VillaType,
     WelcomeOfferType,
@@ -128,7 +129,7 @@ def build_villa_availability(villa, days: int = 120) -> VillaAvailabilityType:
     and the panel never has to guess what the change did.
     """
     days = max(7, min(days, 365))
-    start = date.today()
+    start = availability.today_local()
     end = start + timedelta(days=days)
 
     bookings = (
@@ -146,12 +147,11 @@ def build_villa_availability(villa, days: int = 120) -> VillaAvailabilityType:
     upcoming = []
     max_guests = 0
     for b in bookings:
-        # Half-open: the check-out day is free for the next guest, so it is
-        # NOT one of the occupied nights.
-        night = max(b.check_in, start)
-        while night < min(b.check_out, end):
-            booked_dates.add(night)
-            night += timedelta(days=1)
+        # Straight off the booking's own segments. Half-open, so the check-out
+        # day is free for the next guest and is NOT an occupied night — and a
+        # stay split around someone else's nights leaves that gap open here
+        # too, rather than colouring in days it never held.
+        booked_dates.update(n for n in b.occupied_nights() if start <= n < end)
         max_guests = max(max_guests, b.guests)
         upcoming.append(
             BookedRangeType(
@@ -161,6 +161,7 @@ def build_villa_availability(villa, days: int = 120) -> VillaAvailabilityType:
                 nights=b.nights,
                 guests=b.guests,
                 guest_name=(b.guest.full_name or b.guest.email or "Guest"),
+                segments=StaySegmentType.list_for(b),
             )
         )
 
@@ -222,7 +223,7 @@ class PropertyQuery:
         user = get_authenticated_user(info)
         if user is None:
             return None
-        booking = (
+        candidates = (
             Booking.objects.filter(
                 guest=user, checked_out_at__isnull=False, review__isnull=True
             )
@@ -230,8 +231,12 @@ class PropertyQuery:
             .select_related("villa", "guest", "villa__owner", "review")
             .prefetch_related("villa__images")
             .order_by("checked_out_at")
-            .first()
         )
+        # The stamp above is only the cheap prefilter — the rule is that every
+        # PART is checked out, which lives in JSON and can't be asked of the
+        # database. Otherwise this popup asks a guest to rate a split stay they
+        # are still due back for; same reasoning as `can_review` in types.py.
+        booking = next((b for b in candidates if b.stay_finished), None)
         if booking is None:
             return None
         return BookingType.from_model(booking, request=info.context.request)

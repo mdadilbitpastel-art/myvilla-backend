@@ -1,3 +1,4 @@
+import logging
 from typing import List
 
 import strawberry
@@ -8,11 +9,18 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db.models import Avg
 from django.utils import timezone
 
+from accounts.auth import get_user_from_request
 from properties import availability
+from properties.models import CheckInVerification
+
+# Same channel the rest of the check-in flow writes to (properties/checkin.py),
+# so a no-show recorded here lands in the one audit trail.
+checkin_logger = logging.getLogger("properties.checkin")
 
 
 def _today():
-    return _date.today()
+    # The app's own clock, not the host process's — see availability.today_local.
+    return availability.today_local()
 
 
 @strawberry.type
@@ -150,6 +158,62 @@ def _house_rules(villa) -> List[str]:
     return rules
 
 
+def _stamp(value) -> str:
+    """An optional datetime as ISO-8601, or "" when it hasn't happened yet."""
+    return value.isoformat() if value else ""
+
+
+@strawberry.type
+class StaySegmentType:
+    """
+    One unbroken run of a stay: arrive, sleep `nights`, leave.
+
+    A stay booked around nights somebody else holds has several of these — the
+    guest checks out the morning the other booking starts and back in the
+    morning it ends. An ordinary stay has exactly one, matching the booking's
+    own check-in/check-out.
+    """
+
+    check_in: str
+    check_out: str
+    nights: int
+    # Which part this is, 1-based — so "Part 2 of 3" needs no arithmetic and
+    # cannot drift from the order the parts are actually listed in.
+    index: int
+    # When this part opens and closes, as wall-clock moments at the property.
+    # Sent NAIVE (no offset), exactly like the booking's own check_in_at, so the
+    # browser shows the hours the host set rather than shifting them into the
+    # viewer's time zone — and so they compare directly against `server_now`,
+    # which is what the client ticks its progress off.
+    check_in_at: str
+    check_out_at: str
+    # When the guest ACTUALLY arrived for this part and left it, as recorded by
+    # the host (PIN-verified arrival, checklist-confirmed departure). "" until
+    # each happens. These are real instants, so unlike the scheduled pair above
+    # they keep their offset and do localise.
+    checked_in_at: str
+    checked_out_at: str
+
+    @classmethod
+    def list_for(cls, booking) -> List["StaySegmentType"]:
+        stays = booking.part_stays()
+        return [
+            cls(
+                check_in=start.isoformat(),
+                check_out=end.isoformat(),
+                nights=(end - start).days,
+                index=i,
+                check_in_at=starts_at.replace(tzinfo=None).isoformat(),
+                check_out_at=ends_at.replace(tzinfo=None).isoformat(),
+                checked_in_at=_stamp(stays.get(i, {}).get("checked_in_at")),
+                checked_out_at=_stamp(stays.get(i, {}).get("checked_out_at")),
+            )
+            for i, (start, end, starts_at, ends_at) in enumerate(
+                booking.stay_segment_windows(), start=1
+            )
+        ]
+
+
 @strawberry.type
 class BookedRangeType:
     """One reservation held on a villa, as its owner sees it."""
@@ -160,6 +224,10 @@ class BookedRangeType:
     nights: int
     guests: int
     guest_name: str
+    # The runs this stay actually occupies. One entry for an ordinary booking;
+    # several when the guest booked around nights that were already taken, in
+    # which case check_in/check_out above only bracket them.
+    segments: List[StaySegmentType]
 
 
 @strawberry.type
@@ -314,6 +382,8 @@ class VillaType:
     # thing already worded for the detail page, so both sides can't drift.
     check_in_time: str
     check_out_time: str
+    # How long past check-in time the host may still check a guest in.
+    grace_period_minutes: int
     pets_allowed: bool
     smoking_allowed: bool
     events_allowed: bool
@@ -409,6 +479,7 @@ class VillaType:
             ],
             check_in_time=_hhmm(villa.check_in_time),
             check_out_time=_hhmm(villa.check_out_time),
+            grace_period_minutes=int(villa.grace_period_minutes or 0),
             pets_allowed=villa.pets_allowed,
             smoking_allowed=villa.smoking_allowed,
             events_allowed=villa.events_allowed,
@@ -457,6 +528,9 @@ class VillaInput:
     # string means the host left it unset.
     check_in_time: str = ""
     check_out_time: str = ""
+    # Minutes after check-in time that a late guest can still be checked in;
+    # 0 / unset keeps the platform default (see DEFAULT_GRACE_MINUTES).
+    grace_period_minutes: int = 0
     pets_allowed: bool = False
     smoking_allowed: bool = False
     events_allowed: bool = False
@@ -495,6 +569,11 @@ class BookingType:
     check_in: str
     check_out: str
     nights: int
+    # The runs the stay is actually made of. One entry for the ordinary
+    # unbroken stay; several when the guest booked around nights somebody else
+    # held, in which case check_in/check_out above are only the outer bounds
+    # and `nights` counts what was slept, not the days between them.
+    segments: List[StaySegmentType]
     guests: int
     price_per_night: float
     subtotal: float
@@ -544,18 +623,92 @@ class BookingType:
     # Hours past the scheduled check-in with the guest still not checked in
     # (0 unless awaiting_checkin) — drives the "X hrs late" text.
     hours_late: float
-    # Whether the guest may still cancel, and the fine a cancellation right now
-    # would carry (0 when free). For cancelled bookings, `cancellation_fee` is
-    # what was actually charged and `refund_amount` what's returned.
+    # The flexible cancellation policy, read at `server_now` (see Booking.
+    # cancellation_policy): whether cancelling is still open, the split a
+    # cancellation right now would carry, and the line to show the guest —
+    # "Free cancellation available." / "50% cancellation charge applies." /
+    # "Cancellation period has expired."
+    #
+    # On a CANCELLED booking these describe what actually happened, and
+    # `cancellation_fee` / `refund_amount` are the frozen amounts; on a live one
+    # `cancellation_fee` is 0 and `cancel_fee_now` / `refund_amount_now` are the
+    # hypothetical split.
     can_cancel: bool
+    refund_percentage: int
+    penalty_percentage: int
+    cancellation_message: str
     cancel_fee_now: float
+    refund_amount_now: float
     cancellation_fee: float
     refund_amount: float
+
+    # --- Check-in window (see Booking.check_in_gate) ---
+    # The host's button, as the server sees it: whether it shows at all, what
+    # colour it is ("grey" before the hour, "green" inside the window, "yellow"
+    # in its closing stretch, "hidden" once it's gone), whether pressing it is
+    # allowed, and how many minutes of the grace period are left.
+    booking_status: str
+    checkin_available: bool
+    button_state: str
+    button_visible: bool
+    grace_period_remaining_minutes: int
+    otp_required: bool
+    checkin_message: str
+    # When the window opens and when it shuts — naive wall-clock, like
+    # check_in_at, so they compare to server_now directly.
+    grace_ends_at: str
+    # Stamped when the window closed with nobody checked in ("" until then),
+    # and whether the host has since chosen to take the guest in anyway.
+    no_show_at: str
+    late_check_in_allowed: bool
+
+    # --- Check-out window (see Booking.check_out_gate) ---
+    # There is no hour to miss on the way out, so this is only "may the host
+    # close this stay right now", plus the line both sides are shown about what
+    # leaving at THIS moment would mean — including, while the guest is still
+    # in, that it would be early and how many nights that gives back.
+    checkout_available: bool
+    checkout_message: str
+    # Whether closing the stay at this moment would be an EARLY departure. What
+    # turns `checkout_message` from a reminder into a warning the host should
+    # read before they verify the PIN.
+    checkout_early_now: bool
+    # And what a departure actually did: leaving before the booked check-out
+    # hands the unused nights back to the calendar and refunds nothing. Both are
+    # 0 / false until it happens.
+    early_check_out: bool
+    released_nights: int
+
+    # --- Stay PINs ---
+    # `checkin_pin` / `checkout_pin` — the digits — are filled in for the GUEST
+    # ALONE, and only while a PIN is live. The host reading the very same booking
+    # gets "": the whole point of the code is that they have to be told it.
+    #
+    # The other three of each are NOT secret and go to both sides: how long the
+    # code has left, that one is waiting to be typed, and how many tries remain.
+    # The host needs all three to run the conversation ("it's expired, ask me for
+    # a new one"), and none of them helps anyone guess the digits.
+    checkin_pin: str
+    checkin_pin_expires_in: int
+    checkin_pin_pending: bool
+    checkin_pin_attempts_left: int
+    checkout_pin: str
+    checkout_pin_expires_in: int
+    checkout_pin_pending: bool
+    checkout_pin_attempts_left: int
+
     # Reviews: whether the guest may review this stay (completed + not yet
     # reviewed), and their review if they've already left one (0 / "" if not).
     can_review: bool
     review_rating: int
     review_comment: str
+    # When the review was posted (ISO instant, "" when there isn't one) — shown
+    # to guest and host alike, so both are reading the same dated statement.
+    review_created_at: str
+    # Whether the guest may still change it: editing closes 24 hours after
+    # posting (Review.EDIT_WINDOW_HOURS), and the Edit control goes with it.
+    can_edit_review: bool
+    review_editable_until: str
 
     @classmethod
     def from_model(cls, booking, request=None) -> "BookingType":
@@ -566,17 +719,65 @@ class BookingType:
         # "hours late" and the live cancellation fee can't disagree with each
         # other by the odd millisecond.
         now = timezone.now()
+        policy = booking.cancellation_policy(now)
+        # Reading a booking is also when a no-show gets written down: nothing
+        # is waiting on the stroke of the hour, so there's no scheduler — the
+        # first look after the window shut records the moment (see sync_no_show).
+        if booking.sync_no_show(now):
+            checkin_logger.info(
+                "checkin event=no_show_recorded booking=%s villa=%s guest=%s at=%s",
+                booking.pk, booking.villa_id, booking.guest_id,
+                booking.no_show_at.isoformat(),
+            )
+        gate = booking.check_in_gate(now)
+        out_gate = booking.check_out_gate(now)
         cancelled = booking.status == booking.STATUS_CANCELLED
         stored_fee = float(booking.cancellation_fee or 0)
+
+        # The live check-in PIN, if there is one. Which of its fields are filled
+        # in depends entirely on who is asking: the digits go to the guest and
+        # to nobody else, so a host inspecting the raw API response of their own
+        # booking finds the same "" the UI shows them.
+        # NOT `request.user`: this app decodes its JWT by hand and never writes
+        # it back there, so Django's `request.user` is anonymous even for a
+        # signed-in guest — which would hide every guest's own PIN from them.
+        viewer = get_user_from_request(request)
+        is_guest = viewer is not None and viewer.pk == booking.guest_id
+        # Only worth a query while the stay is actually at that point: a PIN
+        # can't be issued outside it, and one issued a moment before the window
+        # shut is refused at verification anyway.
+        pin_row = (
+            CheckInVerification.live_for(booking, now, purpose=CheckInVerification.PURPOSE_CHECK_IN)
+            if gate.otp_required
+            else None
+        )
+        out_pin_row = (
+            CheckInVerification.live_for(booking, now, purpose=CheckInVerification.PURPOSE_CHECK_OUT)
+            if out_gate.available
+            else None
+        )
         # The guest's review of this stay, if any (reverse one-to-one).
         try:
             review = booking.review
         except ObjectDoesNotExist:
             review = None
-        # A stay can be reviewed once it's completed (checked out), isn't
-        # cancelled, and hasn't been reviewed yet.
+        # A stay can be reviewed once it is genuinely over, isn't cancelled, and
+        # hasn't been reviewed yet.
+        #
+        # `stay_finished` — every PART checked out — not `checked_out_at`, which
+        # answers a different question on a split stay. A stay that was booked
+        # unbroken, stayed, and closed out carries that stamp forever; if nights
+        # in the middle are later taken by somebody else the same booking becomes
+        # two parts, and the guest is due back for the second one with the old
+        # stamp still sitting there. That guest was being offered "Rate stay" on
+        # a stay they hadn't taken yet.
+        # `any_part_arrived` as well as finished: the parts also run out on a
+        # guest who never turned up, and a no-show has no stay to rate.
         can_review = (
-            booking.checked_out_at is not None and not cancelled and review is None
+            booking.stay_finished
+            and booking.any_part_arrived
+            and not cancelled
+            and review is None
         )
 
         def absolute(url: str) -> str:
@@ -602,6 +803,7 @@ class BookingType:
             check_in=booking.check_in.isoformat(),
             check_out=booking.check_out.isoformat(),
             nights=booking.nights,
+            segments=StaySegmentType.list_for(booking),
             guests=booking.guests,
             price_per_night=float(booking.price_per_night),
             subtotal=float(booking.subtotal),
@@ -638,20 +840,71 @@ class BookingType:
             # so the browser shows them exactly as set, never shifted to the
             # viewer's local time. (checked_in_at/out_at above are real instants
             # and stay tz-aware, so they DO localise — that's correct for them.)
-            check_in_at=booking.check_in_datetime().replace(tzinfo=None).isoformat(),
-            check_out_at=booking.check_out_datetime().replace(tzinfo=None).isoformat(),
+            #
+            # These follow the PART in front of us, which on an unbroken stay
+            # is the stay itself. That is what makes the check-in button open on
+            # the right hour after a split stay's first part is closed off: the
+            # window it counts down to is part two's, not the booking's.
+            check_in_at=booking.current_part_opens_at().replace(tzinfo=None).isoformat(),
+            check_out_at=booking.current_part_ends_at().replace(tzinfo=None).isoformat(),
             server_now=timezone.localtime(now).replace(tzinfo=None).isoformat(
                 timespec="seconds"
             ),
             lifecycle_status=booking.lifecycle_status(now),
             hours_late=booking.hours_late(now),
-            can_cancel=booking.can_cancel(now),
-            cancel_fee_now=float(booking.cancel_fee_at(now)),
+            can_cancel=policy.can_cancel,
+            refund_percentage=policy.refund_percentage,
+            penalty_percentage=policy.penalty_percentage,
+            cancellation_message=policy.message,
+            cancel_fee_now=float(policy.penalty_amount),
+            refund_amount_now=float(policy.refund_amount),
             cancellation_fee=stored_fee,
             refund_amount=(float(booking.total) - stored_fee) if cancelled else 0.0,
+            booking_status=gate.booking_status,
+            checkin_available=gate.checkin_available,
+            button_state=gate.button_state,
+            button_visible=gate.button_visible,
+            grace_period_remaining_minutes=gate.grace_period_remaining_minutes,
+            otp_required=gate.otp_required,
+            checkin_message=gate.message,
+            grace_ends_at=gate.grace_ends_at.replace(tzinfo=None).isoformat(),
+            no_show_at=booking.no_show_at.isoformat() if booking.no_show_at else "",
+            late_check_in_allowed=booking.late_check_in_allowed,
+            checkout_available=out_gate.available,
+            checkout_message=out_gate.message,
+            checkout_early_now=out_gate.early,
+            # What actually happened, never what would: `checkout_message` is
+            # the "if they left now" half, and these two are the record of a
+            # departure that already took place.
+            early_check_out=booking.released_nights > 0,
+            released_nights=int(booking.released_nights or 0),
+            # The digits, to the guest alone (see the field comments above).
+            checkin_pin=(pin_row.pin if pin_row and is_guest else ""),
+            checkin_pin_expires_in=(pin_row.seconds_left(now) if pin_row else 0),
+            checkin_pin_pending=pin_row is not None,
+            checkin_pin_attempts_left=(
+                pin_row.attempts_left if pin_row else CheckInVerification.MAX_FAILED_ATTEMPTS
+            ),
+            checkout_pin=(out_pin_row.pin if out_pin_row and is_guest else ""),
+            checkout_pin_expires_in=(out_pin_row.seconds_left(now) if out_pin_row else 0),
+            checkout_pin_pending=out_pin_row is not None,
+            checkout_pin_attempts_left=(
+                out_pin_row.attempts_left
+                if out_pin_row
+                else CheckInVerification.MAX_FAILED_ATTEMPTS
+            ),
             can_review=can_review,
             review_rating=int(review.rating) if review else 0,
             review_comment=(review.comment or "") if review else "",
+            review_created_at=(
+                review.created_at.isoformat() if review and review.created_at else ""
+            ),
+            can_edit_review=bool(review and review.can_edit(now)),
+            review_editable_until=(
+                review.editable_until().isoformat()
+                if review and review.created_at
+                else ""
+            ),
         )
 
 
@@ -661,6 +914,12 @@ class BookingInput:
     check_in: str  # ISO date "YYYY-MM-DD"
     check_out: str  # ISO date "YYYY-MM-DD"
     guests: int = 1
+    # How many nights the page priced before the guest typed a card number.
+    # A range can contain nights somebody else holds — those are skipped and
+    # not charged — so the count is not simply check_out minus check_in, and if
+    # availability moves mid-checkout the server re-quotes rather than charging
+    # for a stay the guest never saw. 0 = not sent (older clients).
+    expected_nights: int = 0
     payment_method: str = ""
     card_number: str = ""
     expiration: str = ""

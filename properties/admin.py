@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Booking, Coupon, Villa, VillaImage
+from .models import Booking, CheckInVerification, Coupon, Villa, VillaImage
 
 
 class VillaImageInline(admin.TabularInline):
@@ -29,6 +29,31 @@ class BookingAdmin(admin.ModelAdmin):
     )
     list_filter = ("status", "created_at")
     search_fields = ("villa__title", "guest__email", "contact_email", "coupon_code")
+
+
+@admin.register(CheckInVerification)
+class CheckInVerificationAdmin(admin.ModelAdmin):
+    """
+    The check-in PIN audit trail. Read-only on purpose: these rows are evidence
+    of what happened at a check-in, and editing one would make it worthless.
+    The PIN itself is deliberately not listed or searchable — the columns here
+    answer "was this guest verified, and did anyone guess at their code", which
+    is what an audit actually asks.
+    """
+
+    list_display = (
+        "id", "booking", "generated_at", "expires_at",
+        "failed_attempts", "verified_at", "invalidated_at", "alert_sent_at",
+    )
+    list_filter = ("verified_at", "alert_sent_at", "generated_at")
+    search_fields = ("booking__id", "booking__guest__email", "booking__villa__title")
+    readonly_fields = [f.name for f in CheckInVerification._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(Coupon)

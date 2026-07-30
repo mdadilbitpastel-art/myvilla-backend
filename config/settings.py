@@ -128,7 +128,16 @@ SIMPLE_JWT = {
 # Internationalization
 # --------------------------------------------------------------------------- #
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "UTC"
+# The wall clock every date rule is judged on. `USE_TZ` keeps storage in UTC;
+# this is only what `timezone.localtime()` answers with — and that is what
+# decides whether a villa's check-in time has passed for today, which day a
+# stay's nights fall on, and the `serverNow` the guest's calendar is handed.
+#
+# It was "UTC", which is where the deployment happens to run rather than where
+# anybody actually arrives at a villa: a 2 PM check-in only closed at 7:30 PM
+# local, so today stayed on the calendar for five and a half hours after the
+# door had shut.
+TIME_ZONE = "Asia/Kolkata"
 USE_I18N = True
 USE_TZ = True
 
@@ -273,3 +282,41 @@ SECURE_SSL_REDIRECT = env.bool("SECURE_SSL_REDIRECT", default=False)
 SECURE_HSTS_SECONDS = env.int("SECURE_HSTS_SECONDS", default=0)
 SECURE_HSTS_INCLUDE_SUBDOMAINS = env.bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", default=False)
 SECURE_HSTS_PRELOAD = env.bool("SECURE_HSTS_PRELOAD", default=False)
+
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
+# Django only configures its own `django` logger, and the root logger has no
+# handler — so an application logger's INFO records are discarded outright
+# (Python's last-resort handler only prints WARNING and above). The check-in
+# audit trail is INFO by nature: every PIN issued, every attempt, every no-show
+# recorded. Without this block those lines exist in the code and nowhere else.
+#
+# Console, not a file: this runs in a container, where stdout IS the log — the
+# platform collects it, and a file inside the image would vanish with it.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "audit": {
+            "format": "[{asctime}] {levelname} {name}: {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "audit",
+        },
+    },
+    "loggers": {
+        # The check-in PIN trail (properties/checkin.py). Never contains a PIN
+        # itself — only who did what, to which booking, and when.
+        "properties.checkin": {
+            "handlers": ["console"],
+            "level": env("CHECKIN_LOG_LEVEL", default="INFO"),
+            "propagate": False,
+        },
+    },
+    "root": {"handlers": ["console"], "level": "WARNING"},
+}
