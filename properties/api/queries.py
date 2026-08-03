@@ -17,6 +17,7 @@ from .types import (
     BookingWindowType,
     CouponPreviewType,
     CouponType,
+    NightsCancellationQuoteType,
     OfferType,
     ReviewType,
     StaySegmentType,
@@ -205,11 +206,44 @@ class PropertyQuery:
         bookings = (
             Booking.objects.filter(guest=user)
             .select_related("villa", "guest", "villa__owner", "review")
-            .prefetch_related("villa__images")
+            .prefetch_related("villa__images", "cancellations")
             .order_by("-created_at")
         )
         request = info.context.request
         return [BookingType.from_model(b, request=request) for b in bookings]
+
+    @strawberry.field
+    def nights_cancellation_quote(
+        self, info: strawberry.Info, id: strawberry.ID, nights: List[str]
+    ) -> NightsCancellationQuoteType:
+        """
+        What giving up these nights of one's own booking would cost and return.
+
+        Read-only and safe to call on every tick of the date picker: it prices
+        the selection with the SAME code the cancellation itself runs (see
+        Booking.nights_cancellation_quote), so the summary the guest reads
+        before confirming is the arithmetic that will actually be performed —
+        and a selection the server would refuse comes back with `allowed` false
+        and the reason, rather than as a button that fails when pressed.
+        """
+        user = require_authenticated_user(info)
+        booking = (
+            Booking.objects.select_related("villa", "guest")
+            .prefetch_related("cancellations")
+            .filter(pk=id, guest=user)
+            .first()
+        )
+        if booking is None:
+            raise GraphQLError("Booking not found.")
+        chosen = []
+        for raw in nights:
+            try:
+                chosen.append(date.fromisoformat(str(raw)[:10]))
+            except ValueError:
+                raise GraphQLError(f"'{raw}' is not a date.")
+        return NightsCancellationQuoteType.from_quote(
+            booking.nights_cancellation_quote(chosen, timezone.now())
+        )
 
     @strawberry.field
     def pending_review_booking(
@@ -229,7 +263,7 @@ class PropertyQuery:
             )
             .exclude(status=Booking.STATUS_CANCELLED)
             .select_related("villa", "guest", "villa__owner", "review")
-            .prefetch_related("villa__images")
+            .prefetch_related("villa__images", "cancellations")
             .order_by("checked_out_at")
         )
         # The stamp above is only the cheap prefilter — the rule is that every
@@ -283,7 +317,7 @@ class PropertyQuery:
         bookings = (
             Booking.objects.filter(villa__owner=user)
             .select_related("villa", "guest", "villa__owner", "review")
-            .prefetch_related("villa__images")
+            .prefetch_related("villa__images", "cancellations")
             .order_by("-created_at")
         )
         request = info.context.request

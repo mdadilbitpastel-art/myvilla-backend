@@ -215,6 +215,142 @@ class StaySegmentType:
 
 
 @strawberry.type
+class BookingCancellationType:
+    """
+    One cancellation event on a booking — the receipt for a whole stay called
+    off, or for the nights of it that were given up (see BookingCancellation).
+
+    A booking may carry several: a guest can drop two nights this week and three
+    more later, and each is priced and refunded on the day it happens.
+    """
+
+    id: strawberry.ID
+    # "full" — the stay was called off — or "partial", some of its nights.
+    kind: str
+    # The nights given up, ISO dates in order, and how many that is.
+    nights: List[str]
+    nights_count: int
+    # What those nights were worth of the booking total, and how it split.
+    # stay_value = cancellation_fee + refund_amount, always.
+    stay_value: float
+    cancellation_fee: float
+    refund_amount: float
+    refund_percentage: int
+    # The policy line the guest was shown as they confirmed it.
+    message: str
+    created_at: str
+
+    @classmethod
+    def list_for(cls, booking) -> List["BookingCancellationType"]:
+        return [
+            cls(
+                id=strawberry.ID(str(row.pk)),
+                kind=row.kind,
+                nights=[n.isoformat() for n in row.night_dates()],
+                nights_count=int(row.nights_count or 0),
+                stay_value=float(row.stay_value or 0),
+                cancellation_fee=float(row.cancellation_fee or 0),
+                refund_amount=float(row.refund_amount or 0),
+                refund_percentage=int(row.refund_percentage or 0),
+                message=row.message or "",
+                created_at=row.created_at.isoformat(),
+            )
+            for row in booking.cancellations.all()
+        ]
+
+
+@strawberry.type
+class BookingNightOptionType:
+    """
+    One night of the stay as the cancel screen sees it (see
+    Booking.night_options): what it would hand back if given up right now, or
+    why it can't be given up at all.
+
+    Every night the booking was made for is here — the ones still held and the
+    ones already cancelled — so the guest is shown their whole stay and reads
+    each night's answer on the night itself, before choosing anything.
+    """
+
+    # The night slept, ISO date, and which part of the stay it belongs to.
+    date: str
+    part_index: int
+    # "open" — may go right now — or why not: "started" (that part is under
+    # way), "expired" (its check-in hour has passed), "cancelled" (already
+    # given up). `cancellable` is "open" said plainly for the picker.
+    state: str
+    cancellable: bool
+    # What this ONE night is worth and how it would split at its part's tier —
+    # indicative, to label the chip. The binding figure is always the quote for
+    # the whole selection, which settles the rounding across the nights picked.
+    # On an already-cancelled night these are what it actually got back.
+    refund_percentage: int
+    stay_value: float
+    refund_amount: float
+    cancellation_fee: float
+    # The policy line for this night, in the guest's words — the free-cancellation
+    # notice, the tier's charge, or the reason it can no longer go.
+    message: str
+
+    @classmethod
+    def list_for(cls, booking, now) -> List["BookingNightOptionType"]:
+        return [
+            cls(
+                date=row["date"].isoformat(),
+                part_index=int(row["part_index"]),
+                state=row["state"],
+                cancellable=bool(row["cancellable"]),
+                refund_percentage=int(row["refund_percentage"]),
+                stay_value=float(row["stay_value"]),
+                refund_amount=float(row["refund_amount"]),
+                cancellation_fee=float(row["cancellation_fee"]),
+                message=row["message"],
+            )
+            for row in booking.night_options(now)
+        ]
+
+
+@strawberry.type
+class NightsCancellationQuoteType:
+    """
+    What giving up a chosen set of nights would cost and hand back — the answer
+    behind the date picker's live summary, priced by the very same code that
+    performs the cancellation (see Booking.nights_cancellation_quote).
+
+    `allowed` False means this selection can't go through, and `error` says why
+    in the guest's own words — a middle night, or a part of the stay that has
+    already begun.
+    """
+
+    nights: List[str]
+    nights_count: int
+    stay_value: float
+    cancellation_fee: float
+    refund_amount: float
+    refund_percentage: int
+    # True when the selection is every night still held: this is a whole-stay
+    # cancellation, and the UI should say so rather than "3 nights".
+    full: bool
+    allowed: bool
+    message: str
+    error: str
+
+    @classmethod
+    def from_quote(cls, quote) -> "NightsCancellationQuoteType":
+        return cls(
+            nights=[n.isoformat() for n in quote.nights],
+            nights_count=quote.nights_count,
+            stay_value=float(quote.stay_value),
+            cancellation_fee=float(quote.penalty_amount),
+            refund_amount=float(quote.refund_amount),
+            refund_percentage=int(quote.refund_percentage),
+            full=quote.full,
+            allowed=quote.allowed,
+            message=quote.message,
+            error=quote.error,
+        )
+
+
+@strawberry.type
 class BookedRangeType:
     """One reservation held on a villa, as its owner sees it."""
 
@@ -626,7 +762,7 @@ class BookingType:
     # The flexible cancellation policy, read at `server_now` (see Booking.
     # cancellation_policy): whether cancelling is still open, the split a
     # cancellation right now would carry, and the line to show the guest —
-    # "Free cancellation available." / "50% cancellation charge applies." /
+    # "Free cancellation available." / the 24-hour non-refundable notice /
     # "Cancellation period has expired."
     #
     # On a CANCELLED booking these describe what actually happened, and
@@ -641,6 +777,28 @@ class BookingType:
     refund_amount_now: float
     cancellation_fee: float
     refund_amount: float
+
+    # --- Giving up part of a stay (see Booking.nights_cancellation_quote) ---
+    # `cancellable_nights` are the nights the guest may still choose to drop:
+    # every night of a part nobody has arrived for and whose check-in hour
+    # hasn't passed. Empty once there is nothing left to give up, which is what
+    # hides the "selected dates" option rather than offering an empty picker.
+    #
+    # `cancelled_nights` are the ones already given up, `active_nights` is what
+    # the guest is still coming for, and `cancellations` is the receipt for each
+    # event — with `refunded_total` their sum. A partially cancelled booking is
+    # still ACTIVE: the stay goes ahead, shorter.
+    cancellable_nights: List[str]
+    cancelled_nights: List[str]
+    # The same stay laid out night by night, each with what cancelling it right
+    # now would hand back — or why it can't go (see Booking.night_options).
+    # This is what the guest's cancel screen draws: every booked date visible,
+    # the ones that can't be cancelled disabled and carrying their reason.
+    night_options: List[BookingNightOptionType]
+    active_nights: int
+    partially_cancelled: bool
+    cancellations: List[BookingCancellationType]
+    refunded_total: float
 
     # --- Check-in window (see Booking.check_in_gate) ---
     # The host's button, as the server sees it: whether it shows at all, what
@@ -733,6 +891,12 @@ class BookingType:
         out_gate = booking.check_out_gate(now)
         cancelled = booking.status == booking.STATUS_CANCELLED
         stored_fee = float(booking.cancellation_fee or 0)
+        # Read once: the nights still up for giving up, the ones already given
+        # up, and the receipts. All three come off the same rows, and the picker
+        # the guest sees is drawn from exactly what the server would accept.
+        cancel_rows = list(booking.cancellations.all())
+        cancelled_nights = booking.cancelled_nights()
+        cancellable_nights = booking.cancellable_nights(now)
 
         # The live check-in PIN, if there is one. Which of its fields are filled
         # in depends entirely on who is asking: the digits go to the guest and
@@ -859,7 +1023,22 @@ class BookingType:
             cancel_fee_now=float(policy.penalty_amount),
             refund_amount_now=float(policy.refund_amount),
             cancellation_fee=stored_fee,
-            refund_amount=(float(booking.total) - stored_fee) if cancelled else 0.0,
+            # What actually went back. Once there are cancellation rows they are
+            # the authority — a booking trimmed twice was refunded twice, and
+            # only they know what each of those was worth. The subtraction is
+            # the fallback for stays cancelled before the rows existed.
+            refund_amount=(
+                float(booking.refunded_total())
+                if cancel_rows
+                else (float(booking.total) - stored_fee) if cancelled else 0.0
+            ),
+            cancellable_nights=[n.isoformat() for n in cancellable_nights],
+            cancelled_nights=[n.isoformat() for n in cancelled_nights],
+            night_options=BookingNightOptionType.list_for(booking, now),
+            active_nights=len(booking.occupied_nights()) if not cancelled else 0,
+            partially_cancelled=bool(cancelled_nights) and not cancelled,
+            cancellations=BookingCancellationType.list_for(booking),
+            refunded_total=float(booking.refunded_total()),
             booking_status=gate.booking_status,
             checkin_available=gate.checkin_available,
             button_state=gate.button_state,

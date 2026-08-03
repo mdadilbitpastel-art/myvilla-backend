@@ -125,6 +125,27 @@ def _parse_time(value: str, label: str):
         raise GraphQLError(f"Enter a valid {label} time.")
 
 
+def _own_booking(info, id) -> Booking:
+    """
+    The booking the CALLER MADE, or a refusal — the guest's side of the pair
+    below, shared by the two cancellation paths.
+
+    Deliberately does not refuse an already-cancelled booking: the cancellation
+    policy has its own wording for that ("This booking is already cancelled."),
+    and the guest should read the same sentence here as on the booking itself.
+    """
+    user = require_authenticated_user(info)
+    booking = (
+        Booking.objects.select_related("villa", "guest", "villa__owner", "review")
+        .prefetch_related("cancellations")
+        .filter(pk=id, guest=user)
+        .first()
+    )
+    if booking is None:
+        raise GraphQLError("Booking not found.")
+    return booking
+
+
 def _owned_booking(info, id) -> Booking:
     """
     The caller's own booking, or a refusal. Shared by the check-in steps.
@@ -875,19 +896,13 @@ class PropertyMutation:
         Cancel one of the current user's own bookings.
 
         The flexible cancellation policy decides both whether this is still
-        allowed and what it costs (see Booking.cancellation_policy): free before
-        the check-in day, a 50% charge on the day itself, and refused from the
-        check-in time onward. The penalty is frozen onto the row here, so what
-        the guest was charged doesn't drift as the clock moves on.
+        allowed and what it costs (see Booking.cancellation_policy): free more
+        than 24 hours before check-in, allowed but wholly non-refundable inside
+        those last 24 hours, and refused from the check-in time onward. The
+        penalty is frozen onto the row here, so what the guest was charged
+        doesn't drift as the clock moves on.
         """
-        user = require_authenticated_user(info)
-        booking = (
-            Booking.objects.select_related("villa", "guest", "villa__owner", "review")
-            .filter(pk=id, guest=user)
-            .first()
-        )
-        if booking is None:
-            raise GraphQLError("Booking not found.")
+        booking = _own_booking(info, id)
         now = timezone.now()
         policy = booking.cancellation_policy(now)
         # One check for every refusal — already cancelled, already checked in,
@@ -895,12 +910,51 @@ class PropertyMutation:
         # the error the guest reads matches the note shown on the booking.
         if not policy.can_cancel:
             raise GraphQLError(policy.message)
-        booking.cancellation_fee = policy.penalty_amount
-        booking.cancelled_at = now
-        booking.status = Booking.STATUS_CANCELLED
-        booking.save(
-            update_fields=["status", "cancelled_at", "cancellation_fee", "updated_at"]
-        )
+        # Priced as "give up every night still held", which is what calling the
+        # stay off is. On a booking already trimmed once, that is the REMAINING
+        # nights and their remaining value — the guest cannot be charged twice
+        # for the nights they handed back last week.
+        quote = booking.nights_cancellation_quote(sorted(booking.occupied_nights()), now)
+        if not quote.allowed:
+            raise GraphQLError(quote.error)
+        with transaction.atomic():
+            booking.apply_nights_cancellation(quote, now)
+        return BookingType.from_model(booking, request=info.context.request)
+
+    @strawberry.mutation
+    def cancel_booking_nights(
+        self, info: strawberry.Info, id: strawberry.ID, nights: List[str]
+    ) -> BookingType:
+        """
+        Give up SOME of the nights of one of the current user's own bookings.
+
+        The guest picks dates rather than throwing the whole stay away: the
+        chosen nights are priced out of the booking, refunded under the same
+        sliding scale a full cancellation uses (judged per stay part), and
+        handed straight back to the villa's calendar for somebody else. The
+        booking stays active — shorter.
+
+        Choosing every night still held is a whole-stay cancellation and is
+        recorded as one; the guest gets there either from this screen or from
+        the Cancel button, and both end in the same place.
+
+        Re-priced HERE, at the server's clock, and never from anything the
+        client sends: the quote the picker showed a minute ago may have crossed
+        a tier boundary since, and what is charged has to be what is true now.
+        """
+        booking = _own_booking(info, id)
+        now = timezone.now()
+        chosen = []
+        for raw in nights:
+            try:
+                chosen.append(date.fromisoformat(str(raw)[:10]))
+            except ValueError:
+                raise GraphQLError(f"'{raw}' is not a date.")
+        quote = booking.nights_cancellation_quote(chosen, now)
+        if not quote.allowed:
+            raise GraphQLError(quote.error)
+        with transaction.atomic():
+            booking.apply_nights_cancellation(quote, now)
         return BookingType.from_model(booking, request=info.context.request)
 
     # --- Check-in, in two steps ---
