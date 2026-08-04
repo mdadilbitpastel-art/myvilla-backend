@@ -9,17 +9,20 @@ from graphql import GraphQLError
 
 from accounts.auth import get_authenticated_user
 from accounts.security import require_authenticated_user
-from properties import availability, coupons as coupon_utils
+from properties import additions as addons, availability, coupons as coupon_utils
 from properties.models import Booking, Coupon, Favorite, Review, Villa, VillaBlockedDate
 from .types import (
     BookedRangeType,
+    BookingEditOptionsType,
     BookingType,
     BookingWindowType,
+    ChangesQuoteType,
     CouponPreviewType,
     CouponType,
     NightsCancellationQuoteType,
     OfferType,
     ReviewType,
+    SavedPaymentType,
     StaySegmentType,
     VillaAvailabilityType,
     VillaType,
@@ -152,14 +155,22 @@ def build_villa_availability(villa, days: int = 120) -> VillaAvailabilityType:
         # day is free for the next guest and is NOT an occupied night — and a
         # stay split around someone else's nights leaves that gap open here
         # too, rather than colouring in days it never held.
-        booked_dates.update(n for n in b.occupied_nights() if start <= n < end)
+        held = b.occupied_nights()
+        booked_dates.update(n for n in held if start <= n < end)
         max_guests = max(max_guests, b.guests)
+        # The range this booking ACTUALLY holds, not the one it was made for.
+        # A guest who left early, or gave up nights, no longer holds the tail of
+        # what they booked — those dates are back on sale, and the coloured
+        # cells above already say so. Listing the frozen booked dates here made
+        # the panel contradict its own calendar: the host read "30 Jul → 10 Aug"
+        # beside ten days that were plainly free.
+        runs = b.stay_segments()
         upcoming.append(
             BookedRangeType(
                 booking_id=strawberry.ID(str(b.id)),
-                check_in=b.check_in.isoformat(),
-                check_out=b.check_out.isoformat(),
-                nights=b.nights,
+                check_in=runs[0][0].isoformat(),
+                check_out=runs[-1][1].isoformat(),
+                nights=len(held) or b.nights,
                 guests=b.guests,
                 guest_name=(b.guest.full_name or b.guest.email or "Guest"),
                 segments=StaySegmentType.list_for(b),
@@ -197,6 +208,20 @@ def build_villa_availability(villa, days: int = 120) -> VillaAvailabilityType:
     )
 
 
+def _own_booking_for_edit(info, id) -> Booking:
+    """The caller's own booking, loaded for the edit screen, or a refusal."""
+    user = require_authenticated_user(info)
+    booking = (
+        Booking.objects.select_related("villa", "guest")
+        .prefetch_related("cancellations", "additions")
+        .filter(pk=id, guest=user)
+        .first()
+    )
+    if booking is None:
+        raise GraphQLError("Booking not found.")
+    return booking
+
+
 @strawberry.type
 class PropertyQuery:
     @strawberry.field
@@ -206,7 +231,7 @@ class PropertyQuery:
         bookings = (
             Booking.objects.filter(guest=user)
             .select_related("villa", "guest", "villa__owner", "review")
-            .prefetch_related("villa__images", "cancellations")
+            .prefetch_related("villa__images", "cancellations", "additions")
             .order_by("-created_at")
         )
         request = info.context.request
@@ -245,6 +270,69 @@ class PropertyQuery:
             booking.nights_cancellation_quote(chosen, timezone.now())
         )
 
+    # --- Editing a booking: what may be added, and what it would cost ---
+    #
+    # The read-only half of properties/additions.py. Every figure below comes
+    # out of the same functions the mutations run, so the screen the guest is
+    # reading is the arithmetic the button will perform — and an addition the
+    # server would refuse arrives as `allowed: false` with its reason, rather
+    # than as a button that fails when pressed.
+
+    @strawberry.field
+    def saved_payments(self, info: strawberry.Info) -> List[SavedPaymentType]:
+        """
+        The ways the current user has paid before, most recent first — what the
+        checkout page offers instead of a blank card form.
+
+        Masked references and billing addresses only; the card number and CVV
+        were never stored. Empty for a guest with no bookings yet, which is what
+        keeps the option off their first checkout rather than showing them an
+        empty list.
+        """
+        return SavedPaymentType.list_for(require_authenticated_user(info))
+
+    @strawberry.field
+    def booking_edit_options(
+        self, info: strawberry.Info, id: strawberry.ID
+    ) -> BookingEditOptionsType:
+        """
+        Everything the edit screen for one's own booking needs to draw itself:
+        the services this stay doesn't have yet, whether either door is open,
+        and the calendar the stay may be extended over — with this booking's own
+        nights marked as its own rather than as dates somebody has taken.
+        """
+        return BookingEditOptionsType.from_booking(
+            _own_booking_for_edit(info, id), timezone.now()
+        )
+
+    @strawberry.field
+    def booking_changes_quote(
+        self,
+        info: strawberry.Info,
+        id: strawberry.ID,
+        services: Optional[List[str]] = None,
+        check_in: Optional[str] = None,
+        check_out: Optional[str] = None,
+    ) -> ChangesQuoteType:
+        """
+        What everything the guest is adding to their own booking would cost —
+        extra services, more nights, or both at once, as ONE figure.
+
+        Either half may be left out. Both are priced together because they are
+        bought together: a service added alongside two extra nights runs over
+        those nights too, which is not something the two halves could work out
+        separately. Safe to call on every tick of the picker.
+        """
+        return ChangesQuoteType.from_quote(
+            addons.quote_changes(
+                _own_booking_for_edit(info, id),
+                services or [],
+                availability.parse_date(check_in),
+                availability.parse_date(check_out),
+                timezone.now(),
+            )
+        )
+
     @strawberry.field
     def pending_review_booking(
         self, info: strawberry.Info
@@ -263,7 +351,7 @@ class PropertyQuery:
             )
             .exclude(status=Booking.STATUS_CANCELLED)
             .select_related("villa", "guest", "villa__owner", "review")
-            .prefetch_related("villa__images", "cancellations")
+            .prefetch_related("villa__images", "cancellations", "additions")
             .order_by("checked_out_at")
         )
         # The stamp above is only the cheap prefilter — the rule is that every
@@ -317,7 +405,7 @@ class PropertyQuery:
         bookings = (
             Booking.objects.filter(villa__owner=user)
             .select_related("villa", "guest", "villa__owner", "review")
-            .prefetch_related("villa__images", "cancellations")
+            .prefetch_related("villa__images", "cancellations", "additions")
             .order_by("-created_at")
         )
         request = info.context.request

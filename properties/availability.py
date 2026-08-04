@@ -115,7 +115,9 @@ def window_end(villa, now=None) -> date:
     return last_bookable_date(villa, now) + timedelta(days=1)
 
 
-def booked_nights(villa_ids: Iterable[int], start: date, end: date) -> Dict[int, set]:
+def booked_nights(
+    villa_ids: Iterable[int], start: date, end: date, exclude_booking_id=None
+) -> Dict[int, set]:
     """
     Per villa, the nights active bookings occupy inside [start, end).
 
@@ -123,6 +125,10 @@ def booked_nights(villa_ids: Iterable[int], start: date, end: date) -> Dict[int,
     check_out, because a split stay does not hold the nights it skipped — those
     belong to whoever the guest booked around, and they must free up on their
     own schedule (or when that other booking is cancelled), not on this one's.
+
+    `exclude_booking_id` leaves one booking out of the count. That is what lets
+    a stay be EXTENDED: a guest asking which dates they may add must not be told
+    their own nights are taken — they are taken by them.
     """
     ids = [int(i) for i in villa_ids]
     if not ids:
@@ -133,6 +139,8 @@ def booked_nights(villa_ids: Iterable[int], start: date, end: date) -> Dict[int,
         check_in__lt=end,
         check_out__gt=start,
     ).only("villa_id", "check_in", "check_out", "segments")
+    if exclude_booking_id is not None:
+        rows = rows.exclude(pk=exclude_booking_id)
 
     nights: Dict[int, set] = {}
     for booking in rows:
@@ -173,13 +181,22 @@ def held_nights(villa, start: date, end: date, for_guest=None, now=None) -> set:
     return nights
 
 
-def taken_nights(villa, start: date, end: date, for_guest=None, now=None) -> set:
+def taken_nights(
+    villa, start: date, end: date, for_guest=None, now=None, exclude_booking_id=None
+) -> set:
     """
     Every night in [start, end) this villa cannot be slept in: held by an
     active booking, closed by the host, or on hold while somebody else pays.
     The one set both the calendar and the stay-splitter are built on.
+
+    `exclude_booking_id` is the booking doing the asking — its own nights don't
+    stand in its way when it is being extended (see `booked_nights`).
     """
-    taken = set(booked_nights([villa.pk], start, end).get(int(villa.pk), set()))
+    taken = set(
+        booked_nights([villa.pk], start, end, exclude_booking_id).get(
+            int(villa.pk), set()
+        )
+    )
     taken.update(
         VillaBlockedDate.objects.filter(
             villa=villa, date__gte=start, date__lt=end
@@ -189,12 +206,17 @@ def taken_nights(villa, start: date, end: date, for_guest=None, now=None) -> set
     return taken
 
 
-def unavailable_dates(villa, now=None, for_guest=None) -> List[date]:
+def unavailable_dates(
+    villa, now=None, for_guest=None, exclude_booking_id=None
+) -> List[date]:
     """
     Every date inside the window a guest may NOT take: already booked by
     someone else, closed by the host, or held while someone else pays. The
     calendar disables exactly these (everything outside the window is disabled
     by the window itself).
+
+    `exclude_booking_id` draws the same calendar for a booking being EDITED:
+    the nights that booking already holds are not obstacles to it.
     """
     return sorted(
         taken_nights(
@@ -202,6 +224,7 @@ def unavailable_dates(villa, now=None, for_guest=None) -> List[date]:
             first_bookable_date(villa, now),
             window_end(villa, now),
             for_guest=for_guest,
+            exclude_booking_id=exclude_booking_id,
         )
     )
 

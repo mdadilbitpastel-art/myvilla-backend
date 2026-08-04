@@ -120,11 +120,41 @@ def issue_pin(booking, *, purpose=CHECK_IN, actor=None, now=None) -> CheckInVeri
     return verification
 
 
+def headcount(booking, guests) -> int:
+    """
+    The number of people the host says are walking in, checked against the
+    villa.
+
+    Refused above the property's capacity — the listing promises a place that
+    sleeps N, and a host who could type any number would be recording a stay
+    the property can't hold (and, in a dispute months later, a figure nobody
+    could stand behind). One place, so the dialog's `max` and what the server
+    will actually accept can never drift apart.
+    """
+    try:
+        count = int(str(guests).strip())
+    except (TypeError, ValueError):
+        raise CheckInError("Enter how many guests are checking in.")
+    if count < 1:
+        raise CheckInError("At least one guest has to be checking in.")
+    capacity = booking.guest_capacity()
+    if count > capacity:
+        raise CheckInError(
+            f"This property sleeps {capacity} guest"
+            f"{'' if capacity == 1 else 's'} — you can't check in {count}."
+        )
+    return count
+
+
 def verify_pin(
-    booking, pin: str, *, purpose=CHECK_IN, actor=None, now=None
+    booking, pin: str, *, purpose=CHECK_IN, guests=None, actor=None, now=None
 ) -> CheckInVerification:
     """
     Check the PIN the host typed and, if it's right, check the guest in or out.
+
+    On the way in the host also states how many people are arriving; it is
+    validated BEFORE the PIN is looked at, so a mistyped headcount costs the
+    host a sentence rather than one of the code's three lives.
 
     Raises CheckInError on every refusal — expired, wrong, or locked — with the
     line to show the host. On success the booking carries the arrival or
@@ -146,6 +176,11 @@ def verify_pin(
         # typing it in.
         _audit("pin_window_closed", booking, actor=actor, purpose=purpose)
         raise CheckInError(message)
+
+    # After the gates (a stay that can't be checked into at all should say so
+    # rather than argue about the headcount) and before the PIN is read, so a
+    # number the property can't hold never costs one of the code's three tries.
+    arriving = headcount(booking, guests) if purpose == CHECK_IN else None
 
     verification = CheckInVerification.live_for(booking, now, purpose=purpose)
     if verification is None:
@@ -205,7 +240,7 @@ def verify_pin(
             released = _record_departure(booking, now)
         else:
             released = 0
-            _record_arrival(booking, now)
+            _record_arrival(booking, now, arriving)
 
     _audit(
         "pin_verified",
@@ -215,20 +250,29 @@ def verify_pin(
         verification=verification.pk,
         late=booking.late_check_in_allowed or None,
         released_nights=released or None,
+        guests=arriving,
     )
     return verification
 
 
-def _record_arrival(booking, now) -> None:
-    """Stamp the arrival the verified PIN just proved. Inside the caller's
-    transaction."""
+def _record_arrival(booking, now, guests=None) -> None:
+    """Stamp the arrival the verified PIN just proved, and who walked in with
+    it. Inside the caller's transaction."""
     # Stamp the PART the guest is arriving for. On a split stay this is the
     # second (or third) arrival, and the booking-level column keeps its plain
     # meaning — the FIRST time they turned up — so it is only set once, by
     # part one.
     part = booking.current_part(now)
     fields = ["segment_stays", "updated_at"]
-    booking.record_part_stay(part["index"] if part else 1, checked_in_at=now)
+    booking.record_part_stay(
+        part["index"] if part else 1, checked_in_at=now, guests=guests
+    )
+    # The headcount is NOT like the arrival stamp beside it: every part
+    # overwrites it, because it answers "how many people are in the property",
+    # and after the second arrival that is the second party, not the first.
+    if guests is not None:
+        booking.checked_in_guests = int(guests)
+        fields.append("checked_in_guests")
     if booking.checked_in_at is None:
         booking.checked_in_at = now
         fields.append("checked_in_at")
@@ -269,6 +313,48 @@ def _record_departure(booking, now) -> int:
         fields.append("checked_out_at")
     booking.save(update_fields=fields)
     return released
+
+
+def sync_forced_check_out(booking, *, now=None) -> bool:
+    """
+    Close a stay nobody closed: the booked check-out hour has passed and the
+    half-hour grace after it has run out.
+
+    No PIN, and deliberately. The code was only ever there to stop a host
+    ending a stay BEFORE its hour; once that hour is behind us there is nothing
+    left for it to protect, and holding the booking open until two people
+    happen to be in the same place with a phone helps nobody — the guest is
+    gone, the property is free, and the record says otherwise.
+
+    Written lazily, the first time the booking is read after the deadline, for
+    the same reason as `sync_no_show`: nothing is waiting on the stroke of the
+    half hour, so there is no scheduler. What that costs is that the stamp must
+    not be "now" — a booking first looked at three days later would claim the
+    guest walked out three days late — so the departure is recorded at the
+    DEADLINE, which is when it actually became true.
+
+    Returns True when it closed something (so callers can log it once).
+    """
+    now = now or timezone.now()
+    due_at = booking.auto_check_out_at(now)
+    if due_at is None or now < due_at:
+        return False
+
+    with transaction.atomic():
+        # At `due_at` the part is still open, so this closes exactly the part
+        # that overran — and releases nothing, because a departure past the
+        # booked hour has no unused nights to give back.
+        released = _record_departure(booking, due_at)
+        booking.forced_check_out_at = due_at
+        booking.save(update_fields=["forced_check_out_at", "updated_at"])
+
+    _audit(
+        "forced_check_out",
+        booking,
+        due_at=due_at.isoformat(),
+        released_nights=released or None,
+    )
+    return True
 
 
 def allow_late_check_in(booking, *, actor=None, now=None) -> None:

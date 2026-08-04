@@ -1,7 +1,7 @@
 import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List
+from typing import List, Optional
 
 import strawberry
 from django.db import transaction
@@ -12,6 +12,7 @@ from django.contrib.auth import get_user_model
 
 from accounts.security import require_authenticated_user
 from properties import (
+    additions as addons,
     availability,
     checkin,
     coupons as coupon_utils,
@@ -30,6 +31,7 @@ from properties.models import (
     VillaImage,
 )
 from .types import (
+    AddonPaymentInput,
     BookingInput,
     BookingType,
     CouponInput,
@@ -43,12 +45,12 @@ from .types import (
 # number; this is the rule itself, for anything that reaches the API another way.
 MAX_IMAGES = 10
 
-# Platform service fee applied on top of the accommodation subtotal.
-SERVICE_FEE_RATE = Decimal("0.141")
-
-# Flat tax on the accommodation subtotal. Mirrored by TAX_RATE in the
-# frontend's lib/pricing.ts — change both together.
-TAX_RATE = Decimal("0.05")
+# Platform service fee applied on top of the accommodation subtotal, and the
+# flat tax on it. Defined in properties/additions.py and imported here so a
+# night added to a stay later is charged exactly what a night booked at checkout
+# was. Mirrored by TAX_RATE in the frontend's lib/pricing.ts.
+SERVICE_FEE_RATE = addons.SERVICE_FEE_RATE
+TAX_RATE = addons.TAX_RATE
 
 # How far ahead a host may open their calendar (see Villa.availability_days).
 MAX_AVAILABILITY_DAYS = 365
@@ -110,6 +112,110 @@ def _mask_reference(raw: str) -> str:
     return _mask_account(ref)[:24]
 
 
+def _accepted_method(villa, raw: str) -> str:
+    """The chosen payment method, checked against what this host takes.
+
+    Defence in depth: the UI only offers accepted methods, but the client can't
+    be trusted, and a villa that takes only PayPal must not receive a card.
+    """
+    method = (raw or "").strip()
+    if not method:
+        raise GraphQLError("Please choose a payment method.")
+    accepted = [str(p).strip() for p in (villa.accepted_payments or []) if str(p).strip()]
+    if accepted and method not in accepted:
+        raise GraphQLError("This villa does not accept that payment method.")
+    return method
+
+
+def _saved_payment(user, villa, raw_method):
+    """
+    The guest's own last payment with this method — masked reference and the
+    billing address that went with it — or a refusal.
+
+    Looked up from THEIR bookings rather than taken from the page: the client
+    sends a method name and nothing else, so a tampered request can only ever
+    reach a card this same guest has genuinely used. Nothing sensitive is
+    involved either way, since only the masked tail was ever stored.
+    """
+    method = _accepted_method(villa, raw_method)
+    row = (
+        Booking.objects.filter(guest=user, payment_method=method)
+        .exclude(card_last4="")
+        .order_by("-created_at")
+        .first()
+    )
+    if row is None:
+        raise GraphQLError(
+            f"You have no saved {method} details. Please enter them below."
+        )
+    return method, row
+
+
+def _resolve_payment(villa, data):
+    """
+    Validate the payment on `data` against what this host accepts, and return
+    `(method, masked_reference)`.
+
+    The guest pays with ONE of the methods the host offers. Card brands
+    (Visa/Mastercard) need card fields plus a billing address; PayPal and Google
+    Pay need only the account reference — so exactly what the chosen method
+    requires is checked, and a PayPal payment is never refused for a missing
+    card. Nothing sensitive survives the call: a card is reduced to its last
+    four digits and an account handle is masked.
+
+    Shared by checkout and by every purchase made against a booking afterwards
+    (see properties/additions.py), so a stay extended next week is paid for
+    under the same rules as the stay itself.
+    """
+    method = _accepted_method(villa, data.payment_method)
+
+    if method in CARD_PAYMENT_METHODS:
+        if len(_digits(data.card_number)) < 12:
+            raise GraphQLError("Enter a valid card number.")
+        if not (data.expiration or "").strip():
+            raise GraphQLError("Enter the card expiration date.")
+        cvv = _digits(data.cvv)
+        if len(cvv) < 3 or len(cvv) > 4:
+            raise GraphQLError("Enter a valid CVV.")
+
+        # --- Billing address (mandatory for card payments) ---
+        if not (data.billing_street or "").strip():
+            raise GraphQLError("Enter your billing street name.")
+        if not (data.billing_city or "").strip():
+            raise GraphQLError("Enter your billing city.")
+        if not (data.billing_country or "").strip():
+            raise GraphQLError("Select your billing country or region.")
+        return method, _mask_account(data.card_number)
+
+    # Account-based methods (PayPal / Google Pay): the reference must be an
+    # e-mail / UPI-style handle.
+    reference = (data.payment_detail or "").strip()
+    if "@" not in reference:
+        if method == "PayPal":
+            raise GraphQLError("Enter the e-mail for your PayPal account.")
+        raise GraphQLError("Enter your UPI ID (name@bank) or Google account e-mail.")
+    return method, _mask_reference(reference)
+
+
+def _addon_payment(booking, payment: AddonPaymentInput):
+    """
+    Settle how an addition to `booking` is being paid for.
+
+    Either the card already on the booking — the guest has paid with it once and
+    should not have to type it again — or a fresh method, validated exactly as
+    checkout validates one. The saved route is refused rather than silently
+    falling through when the booking has nothing on file, so nobody is ever
+    charged against a payment method that isn't there.
+    """
+    if payment is not None and payment.use_saved:
+        if not booking.payment_method:
+            raise GraphQLError(
+                "This booking has no saved payment method. Please choose one."
+            )
+        return booking.payment_method, booking.card_last4
+    return _resolve_payment(booking.villa, payment)
+
+
 def _parse_time(value: str, label: str):
     """
     "HH:MM" (what <input type="time"> submits) -> a `time`, or None when the
@@ -137,7 +243,7 @@ def _own_booking(info, id) -> Booking:
     user = require_authenticated_user(info)
     booking = (
         Booking.objects.select_related("villa", "guest", "villa__owner", "review")
-        .prefetch_related("cancellations")
+        .prefetch_related("cancellations", "additions")
         .filter(pk=id, guest=user)
         .first()
     )
@@ -680,49 +786,17 @@ class PropertyMutation:
             )
 
         # --- Payment details ---
-        # The guest pays with ONE of the methods the host accepts. Card brands
-        # (Visa/Mastercard) need card fields + a billing address; PayPal and
-        # Google Pay need only the account reference. We validate exactly what
-        # the chosen method requires so a PayPal booking isn't rejected for a
-        # missing card, and vice-versa.
-        method = (data.payment_method or "").strip()
-        if not method:
-            raise GraphQLError("Please choose a payment method.")
-        # The host must actually accept this method (defence in depth — the UI
-        # only offers accepted ones, but the client can't be trusted).
-        accepted = [str(p).strip() for p in (villa.accepted_payments or []) if str(p).strip()]
-        if accepted and method not in accepted:
-            raise GraphQLError("This villa does not accept that payment method.")
-
-        is_card = method in CARD_PAYMENT_METHODS
-        if is_card:
-            if len(_digits(data.card_number)) < 12:
-                raise GraphQLError("Enter a valid card number.")
-            if not (data.expiration or "").strip():
-                raise GraphQLError("Enter the card expiration date.")
-            cvv = _digits(data.cvv)
-            if len(cvv) < 3 or len(cvv) > 4:
-                raise GraphQLError("Enter a valid CVV.")
-
-            # --- Billing address (mandatory for card payments) ---
-            if not (data.billing_street or "").strip():
-                raise GraphQLError("Enter your billing street name.")
-            if not (data.billing_city or "").strip():
-                raise GraphQLError("Enter your billing city.")
-            if not (data.billing_country or "").strip():
-                raise GraphQLError("Select your billing country or region.")
-            payment_reference = _mask_account(data.card_number)
+        # Either the way this guest has paid before — nothing to retype, and
+        # nothing sensitive was ever stored to retype — or a fresh method,
+        # validated against what this host accepts and reduced to a masked
+        # reference (see _resolve_payment), which is the same code every later
+        # purchase against this booking goes through.
+        saved = None
+        if data.use_saved_payment:
+            method, saved = _saved_payment(user, villa, data.payment_method)
+            payment_reference = saved.card_last4
         else:
-            # Account-based methods (PayPal / Google Pay): the reference must be
-            # an e-mail / UPI-style handle.
-            reference = (data.payment_detail or "").strip()
-            if "@" not in reference:
-                if method == "PayPal":
-                    raise GraphQLError("Enter the e-mail for your PayPal account.")
-                raise GraphQLError(
-                    "Enter your UPI ID (name@bank) or Google account e-mail."
-                )
-            payment_reference = _mask_reference(reference)
+            method, payment_reference = _resolve_payment(villa, data)
 
         # --- Additional information ---
         email = (data.contact_email or "").strip()
@@ -803,12 +877,14 @@ class PropertyMutation:
             extras_total=extras_total,
             payment_method=method,
             card_last4=payment_reference,
-            billing_street=(data.billing_street or "").strip(),
-            billing_apartment=(data.billing_apartment or "").strip(),
-            billing_city=(data.billing_city or "").strip(),
-            billing_state=(data.billing_state or "").strip(),
-            billing_zip=(data.billing_zip or "").strip(),
-            billing_country=(data.billing_country or "").strip(),
+            # The saved card brings its own billing address — that is most of
+            # what "don't make me type it again" means.
+            billing_street=(saved.billing_street if saved else data.billing_street or "").strip(),
+            billing_apartment=(saved.billing_apartment if saved else data.billing_apartment or "").strip(),
+            billing_city=(saved.billing_city if saved else data.billing_city or "").strip(),
+            billing_state=(saved.billing_state if saved else data.billing_state or "").strip(),
+            billing_zip=(saved.billing_zip if saved else data.billing_zip or "").strip(),
+            billing_country=(saved.billing_country if saved else data.billing_country or "").strip(),
             contact_email=email,
             contact_phone=(data.contact_phone or "").strip(),
         )
@@ -957,6 +1033,65 @@ class PropertyMutation:
             booking.apply_nights_cancellation(quote, now)
         return BookingType.from_model(booking, request=info.context.request)
 
+    # --- Adding to a booking that is already paid for ---
+    #
+    # The other direction from the two above: a stay can grow as well as shrink.
+    # Both mutations are the guest's own, both re-price on the server's clock at
+    # the moment the button is pressed rather than trusting the quote the screen
+    # was showing, and both charge for what they add — a booking never gains a
+    # service or a night for free. Nothing is ever removed by either: services
+    # already bought stay bought, and nights are given back through the
+    # cancellation path, with its refund ladder.
+
+    @strawberry.mutation
+    def add_to_booking(
+        self,
+        info: strawberry.Info,
+        id: strawberry.ID,
+        payment: AddonPaymentInput,
+        services: Optional[List[str]] = None,
+        check_in: Optional[str] = None,
+        check_out: Optional[str] = None,
+    ) -> BookingType:
+        """
+        Add extra services, more nights, or BOTH to one of the current user's
+        own bookings — in one charge.
+
+        One mutation and not two on purpose. A guest who adds two nights and
+        breakfast has made a single decision, and splitting it would take two
+        payments off their card, write two receipts, and — worse — price the
+        breakfast over the stay they had rather than the one they were buying.
+        Here the nights settle first and the services are quoted over the longer
+        stay, which is what they will actually be delivered on.
+
+        Everything is decided HERE, at the server's clock and inside the villa's
+        lock, never from the quote the screen was showing: services must be ones
+        the villa offers and this booking doesn't already have, priced from the
+        villa's own list; nights must be free, inside the host's window, still
+        ahead of the guest and joined to the stay. Nights the booking already
+        holds are kept and not charged for.
+        """
+        booking = _own_booking(info, id)
+        now = timezone.now()
+        with transaction.atomic():
+            # Locked for the same reason checkout locks it: two guests reaching
+            # for the same night must queue, not both be sold it.
+            Villa.objects.select_for_update().filter(pk=booking.villa_id).first()
+            quote = addons.quote_changes(
+                booking,
+                services or [],
+                availability.parse_date(check_in),
+                availability.parse_date(check_out),
+                now,
+            )
+            if not quote.allowed:
+                raise GraphQLError(quote.error)
+            method, reference = _addon_payment(booking, payment)
+            addons.apply_changes(
+                booking, quote, method=method, reference=reference, now=now
+            )
+        return BookingType.from_model(booking, request=info.context.request)
+
     # --- Check-in, in two steps ---
     #
     # A host cannot check a guest in by pressing a button: pressing it issues a
@@ -988,11 +1123,21 @@ class PropertyMutation:
 
     @strawberry.mutation
     def verify_check_in(
-        self, info: strawberry.Info, id: strawberry.ID, pin: str
+        self,
+        info: strawberry.Info,
+        id: strawberry.ID,
+        pin: str,
+        guests: Optional[int] = None,
     ) -> BookingType:
         """
-        Step 2: the host types the PIN the guest read out. If it matches a live
-        code, the guest is checked in and the PIN is spent.
+        Step 2: the host types the PIN the guest read out, together with how
+        many people are actually walking in. If the PIN matches a live code the
+        guest is checked in, the headcount is recorded on the booking, and the
+        PIN is spent.
+
+        `guests` is required for a check-in and capped at the villa's capacity
+        (see checkin.headcount) — optional only in the schema, so an older
+        client gets the server's sentence about it rather than a type error.
 
         Three wrong tries lock that code and email the guest a security alert;
         the host can issue a fresh one with `startCheckIn` while the check-in
@@ -1000,7 +1145,9 @@ class PropertyMutation:
         """
         booking = _owned_booking(info, id)
         try:
-            checkin.verify_pin(booking, pin, actor=require_authenticated_user(info))
+            checkin.verify_pin(
+                booking, pin, guests=guests, actor=require_authenticated_user(info)
+            )
         except checkin.CheckInError as exc:
             raise GraphQLError(str(exc))
         return BookingType.from_model(booking, request=info.context.request)

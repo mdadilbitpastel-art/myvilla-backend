@@ -1,0 +1,582 @@
+"""
+Adding to a booking that has already been paid for.
+
+A stay is not settled the moment it is booked. The guest may decide they do
+want the airport pickup after all, or that they'd like two more nights on the
+end — and neither should mean cancelling and booking again, which costs them a
+cancellation fee and risks losing the villa to somebody else in between.
+
+So a booking can GROW, and this is where growing is priced and carried out.
+Two things can be added:
+
+  * extra services the villa offers and this booking doesn't have yet, charged
+    per night over the nights of the stay that haven't started;
+  * nights, next to (or in the gap of) the nights already held, charged at the
+    stay's own frozen nightly rate with the same fee and tax the checkout
+    applied.
+
+Nothing here ever REMOVES anything. Services already bought stay bought, and
+nights are given up through `Booking.nights_cancellation_quote` — with its
+refund ladder — not through this module. Everything is priced on the server's
+clock at the moment it is asked, exactly like a cancellation, so a quote the
+guest reads is the arithmetic the button performs.
+"""
+
+from dataclasses import dataclass, field
+from datetime import date, timedelta
+from decimal import Decimal, ROUND_HALF_UP
+from typing import List, Optional
+
+from django.utils import timezone
+
+from properties import availability
+from properties.models import Booking, BookingAddition
+
+# Platform service fee and flat tax on the accommodation subtotal. The single
+# source for both — `properties/api/mutations.py` imports them from here so a
+# night added later is charged exactly what a night booked at checkout was.
+SERVICE_FEE_RATE = Decimal("0.141")
+TAX_RATE = Decimal("0.05")
+
+MSG_CANCELLED = "This booking has been cancelled, so nothing can be added to it."
+MSG_STAY_OVER = "This stay is over, so nothing can be added to it."
+MSG_NO_NIGHTS_LEFT = (
+    "Every night of this stay has already begun, so there is nothing left to "
+    "add a service to."
+)
+
+
+def _money(value) -> Decimal:
+    return Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _pretty(day: date) -> str:
+    return day.strftime("%d %b %Y")
+
+
+def blocked_reason(booking: Booking, now=None) -> str:
+    """
+    Why this booking can't be added to at all, or "" when it can.
+
+    Two doors are shut: a cancelled booking is not a stay any more, and a stay
+    every part of which is behind us has nothing left to sell. Everything else
+    — upcoming, under way, even a stay whose first part is finished — is open,
+    because there are still nights ahead to deliver on.
+    """
+    now = now or timezone.now()
+    if booking.status == Booking.STATUS_CANCELLED:
+        return MSG_CANCELLED
+    if booking.stay_over(now):
+        return MSG_STAY_OVER
+    return ""
+
+
+# --------------------------------------------------------------------------
+# Extra services
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ServiceQuote:
+    """What adding a set of services to a booking would cost, right now."""
+
+    # Each chosen service as it would be frozen onto the booking:
+    # {"name", "price", "nights", "amount"}.
+    services: List[dict] = field(default_factory=list)
+    # The nights every one of them is charged over — the stay's remaining
+    # nights, which is what the guest can actually be given.
+    nights: List[date] = field(default_factory=list)
+    amount: Decimal = Decimal("0.00")
+    allowed: bool = False
+    error: str = ""
+    message: str = ""
+
+    @property
+    def nights_count(self) -> int:
+        return len(self.nights)
+
+
+def quote_services(booking: Booking, names, now=None, extra_nights=()) -> ServiceQuote:
+    """
+    Price adding these services to `booking`, at the server's clock.
+
+    A service is delivered on a night, so it is charged for the nights that
+    haven't started yet and no others: a guest buying breakfast on the third
+    morning of a five-night stay pays for the two mornings still to come, not
+    for the five they booked. That is also why a stay with no nights left ahead
+    of it refuses the sale outright rather than charging for nothing.
+
+    Unknown names, services the booking already has, and duplicates are all
+    dropped rather than refused — the client sends names, the villa's own list
+    decides what they cost, and nothing a tampered page sends can invent a
+    service or a price.
+
+    `extra_nights` are nights being bought in the SAME breath (see
+    `quote_changes`). A guest adding two nights and breakfast in one go is
+    buying breakfast for those nights too — quoting the service over the stay as
+    it stands would sell them a service that stops before their stay does.
+    """
+    now = now or timezone.now()
+    quote = ServiceQuote()
+
+    blocked = blocked_reason(booking, now)
+    if blocked:
+        quote.error = blocked
+        return quote
+
+    quote.nights = sorted(set(booking.unstarted_nights(now)) | set(extra_nights))
+    if not quote.nights:
+        quote.error = MSG_NO_NIGHTS_LEFT
+        return quote
+
+    offered = {
+        str(s["name"]).strip().lower(): s
+        for s in booking.available_extra_services()
+    }
+    if not offered:
+        quote.error = (
+            "You already have every extra service this villa offers."
+            if booking.service_entries()
+            else "This villa doesn't offer any extra services."
+        )
+        return quote
+
+    seen = set()
+    nights = len(quote.nights)
+    for raw in names or []:
+        key = str(raw or "").strip().lower()
+        service = offered.get(key)
+        if service is None or key in seen:
+            continue
+        seen.add(key)
+        price = _money(service["price"])
+        quote.services.append(
+            {
+                "name": service["name"],
+                "price": float(price),
+                "nights": nights,
+                "amount": float(_money(price * nights)),
+            }
+        )
+
+    if not quote.services:
+        quote.error = "Choose at least one service to add."
+        return quote
+
+    quote.amount = _money(sum(Decimal(str(s["amount"])) for s in quote.services))
+    quote.allowed = True
+    quote.message = (
+        f"Charged for the {nights} night{'' if nights == 1 else 's'} of your stay "
+        "that haven't started yet."
+    )
+    return quote
+
+
+def _stage_services(booking: Booking, quote: ServiceQuote, now) -> list:
+    """
+    Fold a services purchase into `booking` IN MEMORY, and say which columns it
+    touched. Nothing is written — see `apply_changes`, which saves once.
+
+    Services already on the booking are never touched: this only ever appends,
+    which is the whole promise of the screen the guest came from.
+    """
+    entries = booking.service_entries()
+    # Backfill the count on services frozen before it existed, so the recompute
+    # below prices them over the stay they were actually bought for rather than
+    # over whatever the stay has since become.
+    for entry in entries:
+        entry["nights"] = booking.service_nights(entry)
+    for service in quote.services:
+        entries.append(
+            {
+                "name": service["name"],
+                "price": service["price"],
+                "nights": service["nights"],
+                # Which nights these are, so a receipt can say more than a count.
+                "added_from": quote.nights[0].isoformat(),
+                "added_at": now.isoformat(),
+            }
+        )
+    booking.extra_services = entries
+    booking.extras_total = booking.extras_value()
+    booking.total = _money(Decimal(str(booking.total or 0)) + quote.amount)
+    return ["extra_services", "extras_total", "total"]
+
+
+# --------------------------------------------------------------------------
+# Extra nights
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class NightsQuote:
+    """What adding a set of nights to a booking would cost, right now."""
+
+    nights: List[date] = field(default_factory=list)
+    # The nights inside the asked-for range the booking ALREADY holds. Not a
+    # problem and not charged — the guest simply dragged over their own stay.
+    kept: List[date] = field(default_factory=list)
+    # The nights inside the range that belong to somebody else. Skipped, not
+    # refused: the villa is free either side of them, so the stay simply
+    # extends around them — the same bargain checkout strikes (see
+    # availability.split_stay).
+    skipped: List[date] = field(default_factory=list)
+    accommodation: Decimal = Decimal("0.00")
+    service_fee: Decimal = Decimal("0.00")
+    tax: Decimal = Decimal("0.00")
+    # The stay's existing services, carried on over the new nights.
+    extras: Decimal = Decimal("0.00")
+    services: List[dict] = field(default_factory=list)
+    amount: Decimal = Decimal("0.00")
+    # What the stay becomes: its new outer dates and how many nights in total.
+    check_in: Optional[date] = None
+    check_out: Optional[date] = None
+    total_nights: int = 0
+    allowed: bool = False
+    error: str = ""
+    message: str = ""
+
+    @property
+    def nights_count(self) -> int:
+        return len(self.nights)
+
+
+def _runs(nights) -> list:
+    """A set of dates as the unbroken (start, end) runs it makes up."""
+    runs, expect = [], None
+    for day in sorted(nights):
+        if expect is not None and day == expect:
+            runs[-1] = (runs[-1][0], day + timedelta(days=1))
+        else:
+            runs.append((day, day + timedelta(days=1)))
+        expect = day + timedelta(days=1)
+    return runs
+
+
+def quote_nights(booking: Booking, check_in: date, check_out: date, now=None) -> NightsQuote:
+    """
+    Price extending `booking` over [check_in, check_out), at the server's clock.
+
+    The rules are the ones the villa already lives by, asked again for a stay
+    that exists: the nights must be inside the host's booking window, free of
+    everybody else (this booking's own nights don't count against it), and
+    still ahead of the guest — a night that has begun can't be bought.
+
+    A night inside the range that somebody else holds does NOT refuse the
+    range — it is skipped, exactly as it is at checkout (see
+    availability.split_stay). The villa is genuinely free either side of it, so
+    the stay extends around it and only the nights actually slept are charged.
+
+    One rule is this screen's own: the range has to JOIN the stay. It may run
+    on from the last night, back from the first, or fill a gap in the middle,
+    but it has to touch what is already held — a detached range would be a
+    second stay hiding inside the first, and the guest should book that, not
+    bolt it on.
+
+    Nothing is charged for nights the guest already holds, so dragging across
+    the whole stay to add a day on the end is not a way to pay twice.
+    """
+    now = now or timezone.now()
+    quote = NightsQuote()
+
+    blocked = blocked_reason(booking, now)
+    if blocked:
+        quote.error = blocked
+        return quote
+
+    if not check_in or not check_out or check_out <= check_in:
+        quote.error = "Choose the dates you'd like to add."
+        return quote
+
+    villa = booking.villa
+    held = booking.occupied_nights()
+    asked, night = [], check_in
+    while night < check_out:
+        asked.append(night)
+        night += timedelta(days=1)
+
+    # The range has to touch the stay: run on from its last night, back from
+    # its first, or fill a gap in the middle. Checked on the RANGE rather than
+    # on the runs it would produce, because a night somebody else holds inside
+    # it is skipped below and would otherwise look like a detached second stay.
+    if held and (check_in > max(held) + timedelta(days=1) or check_out < min(held)):
+        quote.error = (
+            "Added nights have to carry on from your stay. Please choose dates "
+            "next to the nights you already have."
+        )
+        return quote
+
+    quote.kept = [n for n in asked if n in held]
+    wanted = [n for n in asked if n not in held]
+    if not wanted:
+        quote.error = "You already have every night in those dates."
+        return quote
+
+    # Still ahead of the guest — a night that has started is being lived in.
+    for day in wanted:
+        if now >= booking.night_starts_at(day):
+            quote.error = (
+                f"{_pretty(day)} has already begun, so it can't be added. "
+                "Please pick nights that are still ahead."
+            )
+            return quote
+
+    # Inside the host's rolling window.
+    first_open = availability.first_bookable_date(villa, now)
+    last_open = availability.last_bookable_date(villa, now)
+    for day in wanted:
+        if day < first_open:
+            quote.error = f"{_pretty(day)} is no longer open for booking."
+            return quote
+        if day > last_open:
+            quote.error = (
+                f"This villa is only open for bookings up to {_pretty(last_open)}."
+            )
+            return quote
+
+    # Free of everybody else. This booking is left out of the count — its own
+    # nights are not in its way (see availability.taken_nights).
+    taken = availability.taken_nights(
+        villa,
+        min(wanted),
+        max(wanted) + timedelta(days=1),
+        for_guest=booking.guest,
+        now=now,
+        exclude_booking_id=booking.pk,
+    )
+    # A night somebody else holds is skipped, not refused — the stay extends
+    # around it. Only a range with nothing free left in it is a dead end.
+    quote.skipped = sorted(taken & set(wanted))
+    wanted = [n for n in wanted if n not in taken]
+    if not wanted:
+        quote.error = (
+            "Every night in those dates is already taken. Please choose other dates."
+        )
+        return quote
+
+    after = _runs(held | set(wanted))
+    count = len(wanted)
+    quote.nights = wanted
+    quote.accommodation = _money(Decimal(str(booking.price_per_night or 0)) * count)
+    quote.service_fee = _money(quote.accommodation * SERVICE_FEE_RATE)
+    quote.tax = _money(quote.accommodation * TAX_RATE)
+
+    # The services on the stay carry on over the new nights — they are per
+    # night, and the guest is not being asked to give them up to stay longer.
+    for entry in booking.service_entries():
+        price = _money(entry.get("price", 0) or 0)
+        if price <= 0:
+            continue
+        quote.services.append(
+            {
+                "name": str(entry.get("name", "")).strip(),
+                "price": float(price),
+                "nights": count,
+                "amount": float(_money(price * count)),
+            }
+        )
+    quote.extras = _money(sum(Decimal(str(s["amount"])) for s in quote.services))
+
+    quote.amount = _money(
+        quote.accommodation + quote.service_fee + quote.tax + quote.extras
+    )
+    quote.check_in = min(after[0][0], booking.check_in)
+    quote.check_out = max(after[-1][1], booking.check_out)
+    quote.total_nights = int(booking.nights or 0) + count
+    quote.allowed = True
+    quote.message = (
+        f"{count} night{'' if count == 1 else 's'} added at "
+        f"{_money(booking.price_per_night)} a night"
+        + (", with your extra services carried on over them." if quote.services else ".")
+        + (
+            f" {len(quote.skipped)} night"
+            f"{' is' if len(quote.skipped) == 1 else 's are'} already taken and "
+            "skipped — you check out and back in around them."
+            if quote.skipped
+            else ""
+        )
+    )
+    return quote
+
+
+def _stage_nights(booking: Booking, quote: NightsQuote) -> list:
+    """
+    Fold an extension into `booking` IN MEMORY, and say which columns it
+    touched. Nothing is written — see `apply_changes`, which saves once.
+
+    The money columns all move together — the stay really is longer, so its
+    subtotal, fee, tax and the nights every per-night figure is worked out
+    against all grow with it (see `Booking.billed_nights`).
+    """
+    booking.add_nights(quote.nights)
+    booking.nights = int(booking.nights or 0) + quote.nights_count
+
+    # Every service on the stay now runs over the new nights too.
+    entries = booking.service_entries()
+    for entry in entries:
+        entry["nights"] = booking.service_nights(entry) + quote.nights_count
+    booking.extra_services = entries
+
+    booking.subtotal = _money(Decimal(str(booking.subtotal or 0)) + quote.accommodation)
+    booking.service_fee = _money(
+        Decimal(str(booking.service_fee or 0)) + quote.service_fee
+    )
+    booking.tax = _money(Decimal(str(booking.tax or 0)) + quote.tax)
+    booking.extras_total = booking.extras_value()
+    booking.total = _money(Decimal(str(booking.total or 0)) + quote.amount)
+
+    return [
+        "check_in",
+        "check_out",
+        "nights",
+        "segments",
+        "segment_stays",
+        "extra_services",
+        "subtotal",
+        "service_fee",
+        "tax",
+        "extras_total",
+        "total",
+    ]
+
+
+# --------------------------------------------------------------------------
+# Both at once
+#
+# A guest adding two nights AND breakfast is making ONE decision and expects one
+# charge for it — not two payments, two receipts and two lines on their card.
+# So the two quotes above are only ever halves: what the screen prices and what
+# the button performs is the pair of them together.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ChangesQuote:
+    """Everything being added to a booking in one go, and what it comes to."""
+
+    services: Optional[ServiceQuote] = None
+    nights: Optional[NightsQuote] = None
+    amount: Decimal = Decimal("0.00")
+    allowed: bool = False
+    error: str = ""
+    message: str = ""
+
+
+def quote_changes(
+    booking: Booking, names=(), check_in: Optional[date] = None,
+    check_out: Optional[date] = None, now=None,
+) -> ChangesQuote:
+    """
+    Price everything the guest is adding, in one answer.
+
+    The nights are quoted first because they change what a service costs: a
+    service bought alongside two extra nights runs over those nights too, so it
+    is priced over the stay the guest is about to have rather than the one they
+    have now. Either half may be empty; if either is refused, the whole thing is
+    — a guest who asked for both and can only have one has not been given what
+    they asked for, and half a purchase is not the sort of surprise to hand
+    somebody at a payment screen.
+    """
+    now = now or timezone.now()
+    combo = ChangesQuote()
+    wants_nights = bool(check_in and check_out)
+    wants_services = bool([n for n in (names or []) if str(n or "").strip()])
+
+    if not wants_nights and not wants_services:
+        combo.error = "Choose the nights or services you'd like to add."
+        return combo
+
+    added_nights = []
+    if wants_nights:
+        combo.nights = quote_nights(booking, check_in, check_out, now)
+        if not combo.nights.allowed:
+            combo.error = combo.nights.error
+            return combo
+        added_nights = combo.nights.nights
+
+    if wants_services:
+        combo.services = quote_services(booking, names, now, extra_nights=added_nights)
+        if not combo.services.allowed:
+            combo.error = combo.services.error
+            return combo
+
+    combo.amount = _money(
+        (combo.nights.amount if combo.nights else Decimal("0.00"))
+        + (combo.services.amount if combo.services else Decimal("0.00"))
+    )
+    combo.allowed = True
+    combo.message = " ".join(
+        part.message
+        for part in (combo.nights, combo.services)
+        if part is not None and part.message
+    )
+    return combo
+
+
+def apply_changes(
+    booking: Booking, combo: ChangesQuote, *, method: str, reference: str, now=None
+) -> BookingAddition:
+    """
+    Carry out everything `combo` describes and return its single receipt.
+
+    Call inside a transaction; the caller saves nothing else. The nights go in
+    first — the services were priced over the longer stay, so the stay has to
+    become longer before they are folded in, or the two would disagree about how
+    many nights the guest just bought breakfast for.
+
+    One receipt, one payment: the guest made one decision.
+    """
+    if not combo.allowed:
+        raise ValueError(combo.error or "Nothing to add.")
+    now = now or timezone.now()
+
+    fields = {"updated_at"}
+    if combo.nights is not None:
+        fields.update(_stage_nights(booking, combo.nights))
+    if combo.services is not None:
+        fields.update(_stage_services(booking, combo.services, now))
+
+    nights = combo.nights
+    services = combo.services
+    record = BookingAddition.objects.create(
+        booking=booking,
+        kind=(
+            BookingAddition.KIND_BOTH
+            if nights and services
+            else BookingAddition.KIND_NIGHTS if nights
+            else BookingAddition.KIND_SERVICES
+        ),
+        # What was BOUGHT, then what was carried on over the new nights — the
+        # `carried` flag is what tells a receipt the two apart, since only the
+        # first are services the guest didn't have before.
+        services=(services.services if services else [])
+        + [{**s, "carried": True} for s in (nights.services if nights else [])],
+        nights=[n.isoformat() for n in (nights.nights if nights else services.nights)],
+        nights_count=(nights.nights_count if nights else 0),
+        accommodation=(nights.accommodation if nights else Decimal("0.00")),
+        service_fee=(nights.service_fee if nights else Decimal("0.00")),
+        tax=(nights.tax if nights else Decimal("0.00")),
+        extras=_money(
+            (nights.extras if nights else Decimal("0.00"))
+            + (services.amount if services else Decimal("0.00"))
+        ),
+        amount=combo.amount,
+        payment_method=method,
+        payment_reference=reference,
+        message=combo.message,
+    )
+    booking.save(update_fields=sorted(fields))
+    _forget_additions(booking)
+    return record
+
+
+def _forget_additions(booking: Booking) -> None:
+    """
+    Drop a prefetched `additions` cache after writing to the relation.
+
+    Same reason `apply_nights_cancellation` drops its own: a booking read with
+    `prefetch_related` is holding the rows that existed when it was read, and
+    the response this request is about to build would otherwise be answered
+    from the state before the addition.
+    """
+    getattr(booking, "_prefetched_objects_cache", {}).pop("additions", None)

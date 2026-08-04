@@ -24,6 +24,18 @@ DEFAULT_GRACE_MINUTES = 120
 # say "still allowed, but not for much longer".
 GRACE_WARNING_MINUTES = 60
 
+# How long past the booked check-out hour a stay is left open before the
+# platform closes it itself.
+#
+# The departure PIN exists for ONE reason: so a host cannot put a guest out
+# before the hour they paid for. Past that hour there is nothing left to
+# protect — the guest's time is up either way — and a stay left open because
+# nobody pressed a button is a stay that goes on reporting a guest in a property
+# they left, blocking the calendar and the review, sometimes for days. So the
+# half hour is the guest's grace to actually walk out, and after it the stay
+# closes without a code, on the clock alone.
+FORCED_CHECK_OUT_MINUTES = 30
+
 
 @dataclass(frozen=True)
 class CheckInGate:
@@ -242,6 +254,13 @@ class NightsCancellationQuote:
     allowed: bool
     message: str
     error: str = ""
+    # Of `stay_value`, what was extra services on those nights — and it comes
+    # back IN FULL, whatever the cancellation ladder charges on the stay itself.
+    # A service is something the host was going to do on a night that is no
+    # longer happening: there is nothing to keep a percentage of. Part of
+    # `refund_amount`, called out separately so the guest can see why the
+    # refund is more than the tier alone would give.
+    extras_value: Decimal = Decimal("0.00")
 
     @property
     def nights_count(self) -> int:
@@ -376,6 +395,19 @@ class Booking(models.Model):
     # booked. Check-out can't be set before check-in (enforced in the mutation).
     checked_in_at = models.DateTimeField(null=True, blank=True)
     checked_out_at = models.DateTimeField(null=True, blank=True)
+    # How many people the host actually counted through the door, recorded with
+    # the arrival they verified. `guests` up top is only what was BOOKED months
+    # earlier — parties turn up short, or with a cousin nobody mentioned — and
+    # the host is the one person standing there able to say. Null until someone
+    # is checked in, which is what keeps "never recorded" distinguishable from
+    # a headcount that happens to match the booking.
+    #
+    # Never more than the villa sleeps: the dialog offers the villa's capacity
+    # as the ceiling and the server holds them to it (see checkin.verify_pin).
+    # On a split stay this is the LATEST arrival's count — the guest leaves and
+    # comes back, possibly with a different party, and each part's own figure
+    # is kept in `segment_stays`.
+    checked_in_guests = models.PositiveIntegerField(null=True, blank=True)
     # LEGACY. Check-out used to be a checklist the host ticked ("keys returned",
     # "property inspected"); it is now PIN-verified like check-in, so nothing
     # writes these any more. They are kept, unread, so the stays that were closed
@@ -400,6 +432,17 @@ class Booking(models.Model):
     # had written it down — but the moment it happened is worth keeping: it's
     # what a host, a support agent or a payout dispute needs months later.
     no_show_at = models.DateTimeField(null=True, blank=True)
+    # Set when the PLATFORM closed this stay rather than the host: the booked
+    # check-out hour came and went, the half-hour grace ran out with nobody
+    # checked out, and it was closed on the clock alone (see
+    # checkin.sync_forced_check_out). Stamped with the DEADLINE, not the moment
+    # somebody happened to load the page — the stay ended when it ended.
+    #
+    # `checked_out_at` carries the same instant, so every reader that only asks
+    # "is this stay over?" needs to know nothing about this. What it adds is the
+    # answer to "who ended it?", which is the question anyone reviewing a
+    # disputed departure months later is actually asking.
+    forced_check_out_at = models.DateTimeField(null=True, blank=True)
     # The host's decision to take a no-show guest in anyway. Re-opens check-in
     # (with the same PIN verification) after the window has closed; the refund
     # stays 0% either way — the guest missed the window they agreed to.
@@ -580,6 +623,7 @@ class Booking(models.Model):
             out[index] = {
                 "checked_in_at": self._parse_stamp(raw.get("checked_in_at")),
                 "checked_out_at": self._parse_stamp(raw.get("checked_out_at")),
+                "guests": self._parse_count(raw.get("guests")),
             }
         # A stay that predates per-part stamps (or was never split) carries its
         # arrival and departure on the booking itself — that IS part one's.
@@ -587,6 +631,7 @@ class Booking(models.Model):
             out[1] = {
                 "checked_in_at": self.checked_in_at,
                 "checked_out_at": self.checked_out_at,
+                "guests": self.checked_in_guests,
             }
         return out
 
@@ -597,7 +642,30 @@ class Booking(models.Model):
         parsed = parse_datetime(str(value))
         return Booking._aware(parsed) if parsed else None
 
-    def record_part_stay(self, index: int, *, checked_in_at=None, checked_out_at=None):
+    @staticmethod
+    def _parse_count(value):
+        """A headcount out of the JSON, or None — a part checked in before the
+        host was asked for one has no number to report, not a zero."""
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count > 0 else None
+
+    def guest_capacity(self) -> int:
+        """
+        The most people this villa sleeps — the ceiling on an arrival headcount.
+
+        Read LIVE off the listing rather than frozen at booking time like the
+        prices and hours: those are terms that were agreed, but how many beds
+        the property has is a fact about the building, and the host counting
+        people in at the door needs today's answer.
+        """
+        return max(1, int(getattr(self.villa, "guests", 0) or 1))
+
+    def record_part_stay(
+        self, index: int, *, checked_in_at=None, checked_out_at=None, guests=None
+    ):
         """Stamp one part's arrival or departure, in place. Caller saves."""
         rows = [dict(r) for r in (self.segment_stays or []) if isinstance(r, dict)]
         row = next((r for r in rows if str(r.get("index")) == str(index)), None)
@@ -608,6 +676,8 @@ class Booking(models.Model):
             row["checked_in_at"] = checked_in_at.isoformat()
         if checked_out_at is not None:
             row["checked_out_at"] = checked_out_at.isoformat()
+        if guests is not None:
+            row["guests"] = int(guests)
         rows.sort(key=lambda r: int(r.get("index") or 0))
         self.segment_stays = rows
 
@@ -692,6 +762,45 @@ class Booking(models.Model):
         return self.current_part_opens_at(now) + timedelta(
             minutes=self.scheduled_grace_minutes()
         )
+
+    def auto_check_out_at(self, now=None):
+        """
+        When this stay closes itself — the part in front of us must be vacated,
+        plus the half hour the guest gets to actually leave. None when there is
+        nothing for a forced check-out to close.
+
+        Only ever set for a part somebody CHECKED INTO. A part nobody arrived
+        for isn't a guest overstaying, it's a no-show, and that has its own
+        ending; forcing a check-out on it would record a departure that never
+        happened.
+        """
+        now = now or timezone.now()
+        part = self.current_part(now)
+        if part is None or part["checked_in_at"] is None:
+            return None
+        return part["ends_at"] + timedelta(minutes=FORCED_CHECK_OUT_MINUTES)
+
+    def auto_check_out_seconds_left(self, now=None) -> int:
+        """
+        Seconds until this stay closes itself, 0 once it is due (or when nothing
+        is open to close). Counted in seconds, not minutes: what the guest and
+        host are shown in the last half hour is a clock running down, and a
+        reading that only moves once a minute reads as frozen.
+        """
+        now = now or timezone.now()
+        due_at = self.auto_check_out_at(now)
+        if due_at is None:
+            return 0
+        return max(0, int((due_at - now).total_seconds()))
+
+    def check_out_overdue(self, now=None) -> bool:
+        """The hour to vacate has passed and nobody has closed the stay — the
+        window in which the countdown to a forced check-out is running."""
+        now = now or timezone.now()
+        part = self.current_part(now)
+        if part is None or part["checked_in_at"] is None:
+            return False
+        return now >= part["ends_at"]
 
     def scheduled_grace_minutes(self) -> int:
         """How long after check-in time the host may still take this guest in:
@@ -946,6 +1055,20 @@ class Booking(models.Model):
                 early=True,
                 nights=released,
             )
+        # Past the hour, the PIN stops being the point. It was only ever there
+        # to stop a host putting a guest out early, and that can no longer
+        # happen — so what both sides need to be told is not how to check out
+        # but that the platform is about to do it for them.
+        if self.check_out_overdue(now):
+            due_at = self.auto_check_out_at(now)
+            when = timezone.localtime(due_at).strftime("%I:%M %p").lstrip("0").lower()
+            return gate(
+                True,
+                (
+                    "The booked check-out time has passed. This stay closes "
+                    f"automatically at {when} — no PIN needed once it does."
+                ),
+            )
         return gate(
             True,
             "Ask the guest for the 4-digit PIN on their booking to check them out.",
@@ -1089,14 +1212,31 @@ class Booking(models.Model):
         return len(self.occupied_nights()) or 1
 
     def cancelled_nights(self) -> list:
-        """Every night already given up on this booking, in date order."""
+        """
+        Every night given up on this booking and NOT since taken back, in date
+        order.
+
+        The receipts are a history, not a state: a guest who dropped a night and
+        later bought it again (see properties/additions.py) has a row saying it
+        went and a stay that plainly holds it. What is true NOW is the stay, so
+        a night the booking currently occupies is not a cancelled night —
+        otherwise it would sit greyed out and unreachable on the cancel screen,
+        having been paid for twice over.
+
+        The money is untouched by this: `cancelled_value` and `refunded_total`
+        read the rows, because what was refunded that day was refunded, whatever
+        happened afterwards.
+        """
+        held = self.occupied_nights()
         nights = set()
         for row in self.cancellations.all():
             for raw in row.nights or []:
                 try:
-                    nights.add(date.fromisoformat(str(raw)[:10]))
+                    night = date.fromisoformat(str(raw)[:10])
                 except ValueError:
                     continue
+                if night not in held:
+                    nights.add(night)
         return sorted(nights)
 
     def cancelled_value(self) -> Decimal:
@@ -1108,15 +1248,92 @@ class Booking(models.Model):
             Decimal("0"),
         )
 
-    def nights_value(self, count: int, *, empties: bool) -> Decimal:
+    def billed_night_set(self) -> list:
         """
-        What `count` nights are worth: their pro-rata share of the total.
+        Every night this booking was priced over — the ones it still holds and
+        the ones it has since given up — in date order.
 
-        Every night of a stay costs the same here — one nightly rate, and the
-        fees, tax, extras and discount around it all belong to the stay as a
-        whole — so a night is worth its share of what was actually paid. That
-        keeps the arithmetic something a guest can check: five nights of an
-        eight-night booking is five-eighths of the money.
+        The denominator's dates, where `billed_nights` is only its size. What a
+        service covers is worked out against this rather than against what is
+        left, so giving up a night doesn't quietly shuffle a service onto a
+        different one.
+        """
+        nights = set(self.occupied_nights())
+        for row in self.cancellations.all():
+            nights.update(row.night_dates())
+        return sorted(nights)
+
+    def service_covered_nights(self, entry) -> set:
+        """
+        Which nights one extra service actually covers.
+
+        A service ticked at checkout runs the whole stay. One bought later runs
+        from the night it was bought (`added_from`) for as many nights as it was
+        charged over — and a stay extended afterwards carries it on, which is
+        why the count is read live rather than assumed (see `service_nights`).
+        """
+        nights = self.billed_night_set()
+        raw = (entry or {}).get("added_from")
+        if raw:
+            try:
+                first = date.fromisoformat(str(raw)[:10])
+                nights = [n for n in nights if n >= first]
+            except ValueError:
+                pass
+        return set(nights[: self.service_nights(entry)])
+
+    def extras_for_night(self, night) -> Decimal:
+        """What the extra services on this booking cost for ONE given night."""
+        total = Decimal("0.00")
+        for entry in self.service_entries():
+            if night in self.service_covered_nights(entry):
+                total += Decimal(str(entry.get("price", 0) or 0))
+        return total
+
+    def extras_for_nights(self, nights) -> Decimal:
+        """
+        What the extra services on these nights cost, all together.
+
+        This is the part of a cancellation that comes back IN FULL: a service
+        is something the host was going to do on a night that is no longer
+        happening, so there is nothing for the ladder to keep a percentage of.
+        The accommodation is what the sliding scale is about.
+        """
+        return sum(
+            (self.extras_for_night(n) for n in nights), Decimal("0.00")
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def stay_only_value(self, count: int) -> Decimal:
+        """
+        What `count` nights of ACCOMMODATION are worth — the stay's own money
+        (rate, fee, tax, less any discount) without the extra services on top.
+
+        Flat across the booking, which is what makes it checkable: five nights
+        of an eight-night stay is five-eighths of it. The services are added per
+        night by `extras_for_nights`, because they are not flat.
+        """
+        stay_only = Decimal(str(self.total or 0)) - Decimal(str(self.extras_total or 0))
+        return (stay_only * Decimal(count) / Decimal(self.billed_nights())).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+
+    def nights_value(self, nights, *, empties: bool) -> Decimal:
+        """
+        What these nights are worth: their share of what was actually paid.
+
+        The stay itself is flat — one nightly rate, with the fee, tax and
+        discount around it belonging to the whole booking — so every night
+        carries the same share of it. That keeps the arithmetic something a
+        guest can check: five nights of an eight-night booking is five-eighths
+        of the accommodation.
+
+        The EXTRA SERVICES are not flat, and are added per night on top. A
+        service bought halfway through a stay covers only the nights that were
+        left (see `service_covered_nights`), so averaging it across the whole
+        booking would refund it on nights it was never delivered on and
+        short-change the nights it was. Giving up a night hands back that
+        night's services with it — at whatever the cancellation policy allows,
+        like the rest of the money.
 
         `empties` is what closes the rounding: the cancellation that gives up
         the last of the stay is worth everything not already given up, so a
@@ -1127,9 +1344,12 @@ class Booking(models.Model):
         already = self.cancelled_value()
         if empties:
             return max(Decimal("0"), total - already)
-        share = (total * Decimal(count) / Decimal(self.billed_nights())).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
+        chosen = list(nights)
+        stay_only = total - Decimal(str(self.extras_total or 0))
+        share = (
+            stay_only * Decimal(len(chosen)) / Decimal(self.billed_nights())
+            + sum((self.extras_for_night(n) for n in chosen), Decimal("0.00"))
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         return max(Decimal("0"), min(share, total - already))
 
     def night_starts_at(self, night):
@@ -1291,17 +1511,26 @@ class Booking(models.Model):
         rather than only after it's been picked.
         """
         now = now or timezone.now()
-        per_night = self.nights_value(1, empties=False)
 
         # What each already-cancelled night actually got back, off the receipt
         # it went out on — the event's own figures split across its nights, so
         # a night cancelled at 90% never reads as anything else later.
+        # A night the booking holds again is not a cancelled night, however many
+        # receipts say it once was — it was bought back, and the picker has to
+        # offer it like any other night of the stay (see `cancelled_nights`).
+        held = self.occupied_nights()
         settled = {}
         for row in self.cancellations.all():
-            dates = row.night_dates()
+            went = row.night_dates()
+            if not went:
+                continue
+            # Divided across every night the EVENT covered, not just the ones
+            # still gone: what one night got back that day doesn't change
+            # because a different night was later bought again.
+            count = Decimal(len(went))
+            dates = [n for n in went if n not in held]
             if not dates:
                 continue
-            count = Decimal(len(dates))
             value = (Decimal(str(row.stay_value or 0)) / count).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
@@ -1378,10 +1607,20 @@ class Booking(models.Model):
                         0,
                         self.MSG_ALREADY_CANCELLED,
                     )
-                refund = (per_night * Decimal(percentage) / Decimal(100)).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
-                add(night, index, state, percentage, message, per_night, refund)
+                # THIS night's own worth, not the stay's average: a night the
+                # guest bought breakfast for is worth more than one they didn't,
+                # and the chip has to say so before it is picked (see
+                # nights_value, which prices the selection the same way).
+                #
+                # And the split the ladder is charged against: the services come
+                # back whole, only the accommodation is tiered, so a night with
+                # a service on it hands back more than its percentage suggests.
+                value = self.nights_value([night], empties=False)
+                extras = min(self.extras_for_night(night), value)
+                refund = extras + (
+                    (value - extras) * Decimal(percentage) / Decimal(100)
+                ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                add(night, index, state, percentage, message, value, refund)
                 night += timedelta(days=1)
 
         # And the nights already given up, back in their place in the stay. A
@@ -1466,21 +1705,26 @@ class Booking(models.Model):
                 return refuse(self.MSG_MIDDLE_NIGHT)
 
         empties = set(chosen) >= held
-        stay_value = self.nights_value(len(chosen), empties=empties)
+        stay_value = self.nights_value(chosen, empties=empties)
+        # The services on those nights, which come back whole (see
+        # `extras_for_nights`). The rest is the accommodation, and only that is
+        # what the cancellation ladder is charged against.
+        extras_value = min(self.extras_for_nights(chosen), stay_value)
+        accommodation = stay_value - extras_value
 
         # Priced per part, then added up: each part's nights carry that part's
         # own tier. The parts' values are shares of the same pro-rata split, so
         # the last one takes the remainder and the pieces still sum to
-        # `stay_value` to the rupee.
-        refund = Decimal("0.00")
+        # `accommodation` to the rupee.
+        refund = extras_value
         spent = Decimal("0.00")
         messages = []
         for position, (index, part_nights) in enumerate(sorted(by_part.items()), start=1):
             if position == len(by_part):
-                value = stay_value - spent
+                value = accommodation - spent
             else:
                 value = (
-                    stay_value * Decimal(len(part_nights)) / Decimal(len(chosen))
+                    accommodation * Decimal(len(part_nights)) / Decimal(len(chosen))
                 ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             spent += value
             percentage = parts[index]["refund_percentage"]
@@ -1505,6 +1749,7 @@ class Booking(models.Model):
             full=empties,
             allowed=True,
             message=" ".join(messages) or self.MSG_FREE,
+            extras_value=extras_value,
         )
 
     def drop_nights(self, nights) -> None:
@@ -1583,6 +1828,7 @@ class Booking(models.Model):
             cancellation_fee=quote.penalty_amount,
             refund_amount=quote.refund_amount,
             refund_percentage=quote.refund_percentage,
+            extras_refund=quote.extras_value,
             message=quote.message,
         )
         # The booking-level fee is the RUNNING total of every event's penalty,
@@ -1619,6 +1865,240 @@ class Booking(models.Model):
     def cancel_fee_at(self, now=None):
         """The penalty a cancellation right now would carry, in currency."""
         return self.cancellation_policy(now).penalty_amount
+
+    # --- Adding to a stay that has already been paid for ---
+    #
+    # A booking is not finished with the moment it is taken. The guest may want
+    # the airport pickup they skipped, or two more nights on the end — and the
+    # answer to both is "yes, and here is what it costs", not "cancel and book
+    # again". What can be added is worked out here; `properties/additions.py`
+    # prices it and carries it out.
+
+    def unstarted_nights(self, now=None) -> list:
+        """
+        The nights of this stay that haven't begun yet, in date order.
+
+        A night starts at the property's check-in hour (see `night_starts_at`),
+        and once it has, it is being lived in: it can't be handed back, and a
+        service bought today cannot be delivered on it retrospectively. So this
+        is the stretch of the stay any addition is priced over — the same
+        stretch a cancellation may still give up.
+        """
+        now = now or timezone.now()
+        return sorted(n for n in self.occupied_nights() if now < self.night_starts_at(n))
+
+    def service_nights(self, entry) -> int:
+        """
+        How many nights one frozen extra service was charged over.
+
+        Services bought at checkout ran the whole stay and carry no count of
+        their own; one bought later runs only from the night it was bought, and
+        says so. The fallback is what keeps every booking taken before this
+        existed reading exactly as it always did.
+        """
+        try:
+            count = int((entry or {}).get("nights") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        return count if count > 0 else self.billed_nights()
+
+    def service_entries(self) -> list:
+        """The booking's extra services as clean dicts, bad rows dropped."""
+        return [
+            s
+            for s in (self.extra_services or [])
+            if isinstance(s, dict) and str(s.get("name", "")).strip()
+        ]
+
+    def extras_value(self) -> Decimal:
+        """
+        What the extra services on this booking come to: each one's per-night
+        price over the nights it was actually bought for.
+
+        The authority for `extras_total`, recomputed rather than incremented so
+        a stay that grew and then had a service added can't drift out of step
+        with the lines the guest is shown.
+        """
+        total = Decimal("0.00")
+        for entry in self.service_entries():
+            price = Decimal(str(entry.get("price", 0) or 0))
+            total += price * Decimal(self.service_nights(entry))
+        return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def taken_service_names(self) -> set:
+        """The services already on this booking, lower-cased for comparison."""
+        return {str(s.get("name", "")).strip().lower() for s in self.service_entries()}
+
+    def available_extra_services(self) -> list:
+        """
+        The villa's extra services this booking does NOT already have, as
+        [{"name", "price"}] straight off the listing.
+
+        Empty when the guest ticked everything on offer (or the host offers
+        nothing) — which is precisely when the "add a service" door should not
+        be there at all, rather than opening onto an empty list.
+        """
+        taken = self.taken_service_names()
+        out = []
+        for raw in self.villa.extra_services or []:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name", "")).strip()
+            if not name or name.lower() in taken:
+                continue
+            try:
+                price = round(float(raw.get("price", 0) or 0), 2)
+            except (TypeError, ValueError):
+                price = 0.0
+            out.append({"name": name, "price": max(0.0, price)})
+        return out
+
+    def add_nights(self, nights) -> None:
+        """
+        Take `nights` INTO the stay, in place. Caller saves.
+
+        The mirror of `drop_nights`: occupancy is read from `segments`, so
+        rewriting the runs WITH these nights is what takes them off the villa's
+        calendar. Nights next to an existing run join it, and nights that fill
+        the gap in a split stay weld its two parts back into one.
+
+        `check_in`/`check_out` DO move here, unlike on a cancellation — they are
+        the outer bounds of the stay, and a stay that now runs two nights longer
+        genuinely ends two nights later. They only ever WIDEN: a booking trimmed
+        at one end keeps the bounds it was made with, because the gap between
+        them and the segments is the record of what was given up (see
+        `drop_nights`). Per-part stamps follow their part into
+        whichever run it ended up in; two parts welded together keep the earlier
+        arrival and the later departure, because that is what happened.
+        """
+        held = self.occupied_nights() | set(nights)
+        if not held:
+            return
+        stays = self.part_stays()
+        old_runs = self.stay_segments()
+
+        runs, night = [], None
+        for day in sorted(held):
+            if night is not None and day == night:
+                runs[-1] = (runs[-1][0], day + timedelta(days=1))
+            else:
+                runs.append((day, day + timedelta(days=1)))
+            night = day + timedelta(days=1)
+
+        # Each old part lands in the run that now contains its first night.
+        index_map = {}
+        for old_index, (start, _end) in enumerate(old_runs, start=1):
+            for new_index, (run_start, run_end) in enumerate(runs, start=1):
+                if run_start <= start < run_end:
+                    index_map[old_index] = new_index
+                    break
+
+        merged = {}
+        for old_index, stay in sorted(stays.items()):
+            new_index = index_map.get(old_index)
+            if new_index is None:
+                continue
+            row = merged.setdefault(new_index, {})
+            for key in ("checked_in_at", "checked_out_at"):
+                value = stay.get(key)
+                if value is None:
+                    continue
+                current = row.get(key)
+                # Two parts welded into one: arrival is the earlier of theirs,
+                # departure the later — the run really was entered once and left
+                # once, whatever it used to be split into.
+                row[key] = (
+                    value
+                    if current is None
+                    else (min(current, value) if key == "checked_in_at" else max(current, value))
+                )
+
+        self.check_in = min(runs[0][0], self.check_in)
+        self.check_out = max(runs[-1][1], self.check_out)
+        # Left empty only when the two dates above describe the stay exactly —
+        # the one case `stay_segments()` falls back to them. A single run that
+        # starts late because its first night was given up is NOT that case: the
+        # fallback would hand the guest back a night they cancelled.
+        self.segments = (
+            []
+            if runs == [(self.check_in, self.check_out)]
+            else [
+                {"check_in": a.isoformat(), "check_out": b.isoformat()}
+                for a, b in runs
+            ]
+        )
+        if merged:
+            self.segment_stays = [
+                {"index": index, **{k: v.isoformat() for k, v in row.items()}}
+                for index, row in sorted(merged.items())
+            ]
+
+
+class BookingAddition(models.Model):
+    """
+    One thing added to a booking after it was paid for, and the payment that
+    covered it.
+
+    A booking can grow more than once — a chef this week, two extra nights next
+    — so what was added is a LIST of events beside `BookingCancellation`'s list
+    of what was given up. Each row is the frozen receipt for one of them: what
+    it was, what it cost, and how it was paid for, in the words the guest
+    confirmed. The booking's own money columns carry the running totals, so
+    everything that only cared "what does this stay cost" is untouched.
+    """
+
+    KIND_SERVICES = "services"
+    KIND_NIGHTS = "nights"
+    # Both in one go — one decision, one payment (see additions.apply_changes).
+    KIND_BOTH = "both"
+    KIND_CHOICES = [
+        (KIND_SERVICES, "Extra services"),
+        (KIND_NIGHTS, "Extra nights"),
+        (KIND_BOTH, "Nights and services"),
+    ]
+
+    booking = models.ForeignKey(
+        Booking, on_delete=models.CASCADE, related_name="additions"
+    )
+    kind = models.CharField(max_length=12, choices=KIND_CHOICES, default=KIND_SERVICES)
+    # The services bought in this event, as [{"name", "price", "nights",
+    # "amount"}]. On a nights purchase these are the services already on the
+    # booking, charged on for the new nights — the guest keeps what they had.
+    services = models.JSONField(default=list, blank=True)
+    # The nights added, as ISO dates in order (empty on a services purchase).
+    nights = models.JSONField(default=list, blank=True)
+    nights_count = models.PositiveIntegerField(default=0)
+    # The split of what was charged. `amount` = accommodation + service_fee +
+    # tax + extras, always — the same arithmetic the original checkout ran, on
+    # what was added. No discount or coupon applies: those were this stay's, at
+    # the moment it was booked.
+    accommodation = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    service_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    tax = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    extras = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    # How this addition was paid for — masked exactly like the booking's own.
+    payment_method = models.CharField(max_length=60, blank=True)
+    payment_reference = models.CharField(max_length=24, blank=True)
+    # The line the guest read as they confirmed it.
+    message = models.CharField(max_length=300, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "properties_bookingaddition"
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"Addition #{self.pk} — booking {self.booking_id} ({self.kind})"
+
+    def night_dates(self) -> list:
+        out = []
+        for raw in self.nights or []:
+            try:
+                out.append(date.fromisoformat(str(raw)[:10]))
+            except ValueError:
+                continue
+        return sorted(out)
 
 
 class BookingCancellation(models.Model):
@@ -1659,6 +2139,11 @@ class BookingCancellation(models.Model):
     cancellation_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     refund_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     refund_percentage = models.PositiveIntegerField(default=0)
+    # How much of `refund_amount` was extra services on those nights. They come
+    # back in full whatever the ladder charged on the stay itself, so a receipt
+    # that didn't name them would look like the percentage was wrong. 0 on
+    # cancellations taken before services could be bought per night.
+    extras_refund = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     # The policy line the guest read as they confirmed it.
     message = models.CharField(max_length=300, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

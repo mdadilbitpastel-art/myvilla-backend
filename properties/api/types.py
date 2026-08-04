@@ -1,16 +1,17 @@
 import logging
-from typing import List
+from typing import List, Optional
 
 import strawberry
 
 from datetime import date as _date
+from decimal import Decimal
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db.models import Avg
 from django.utils import timezone
 
 from accounts.auth import get_user_from_request
-from properties import availability
+from properties import availability, checkin
 from properties.models import CheckInVerification
 
 # Same channel the rest of the check-in flow writes to (properties/checkin.py),
@@ -35,10 +36,24 @@ class VillaImageType:
 
 @strawberry.type
 class ExtraServiceType:
-    """A premium add-on: a name and its per-night price."""
+    """A premium add-on: a name and its per-night price.
+
+    On a VILLA that is the whole story — the host's list, priced per night. On a
+    BOOKING the two below say what was actually bought: how many nights this one
+    was charged over and what that came to. A service ticked at checkout ran the
+    whole stay; one bought later runs from the night it was bought, so the two
+    can't be assumed equal any more (see Booking.service_nights). They are 0 on
+    the villa's own list, which has no stay to be charged over.
+    """
 
     name: str
     price: float
+    nights: int = 0
+    amount: float = 0
+    # On an ADDITION's receipt: this service was already on the booking and was
+    # carried on over the nights being added, rather than bought in that
+    # purchase. False everywhere else (see BookingAddition.services).
+    carried: bool = False
 
 
 @strawberry.input
@@ -193,6 +208,10 @@ class StaySegmentType:
     # they keep their offset and do localise.
     checked_in_at: str
     checked_out_at: str
+    # How many people the host counted in for THIS part (0 until they do). A
+    # split stay is arrived at more than once and the party can be a different
+    # size each time, so the figure belongs to the part, not to the booking.
+    checked_in_guests: int
 
     @classmethod
     def list_for(cls, booking) -> List["StaySegmentType"]:
@@ -207,6 +226,7 @@ class StaySegmentType:
                 check_out_at=ends_at.replace(tzinfo=None).isoformat(),
                 checked_in_at=_stamp(stays.get(i, {}).get("checked_in_at")),
                 checked_out_at=_stamp(stays.get(i, {}).get("checked_out_at")),
+                checked_in_guests=int(stays.get(i, {}).get("guests") or 0),
             )
             for i, (start, end, starts_at, ends_at) in enumerate(
                 booking.stay_segment_windows(), start=1
@@ -236,6 +256,9 @@ class BookingCancellationType:
     cancellation_fee: float
     refund_amount: float
     refund_percentage: int
+    # How much of the refund was extra services on those nights — handed back
+    # in full, whatever the ladder charged on the stay itself.
+    extras_refund: float
     # The policy line the guest was shown as they confirmed it.
     message: str
     created_at: str
@@ -252,11 +275,300 @@ class BookingCancellationType:
                 cancellation_fee=float(row.cancellation_fee or 0),
                 refund_amount=float(row.refund_amount or 0),
                 refund_percentage=int(row.refund_percentage or 0),
+                extras_refund=float(row.extras_refund or 0),
                 message=row.message or "",
                 created_at=row.created_at.isoformat(),
             )
             for row in booking.cancellations.all()
         ]
+
+
+@strawberry.type
+class BookingAdditionType:
+    """
+    One thing added to a booking after it was paid for, and what it cost (see
+    BookingAddition) — the mirror of BookingCancellationType.
+
+    A stay can grow more than once, so this is a list too: services bought on
+    Tuesday, two more nights on Friday, each with the payment that covered it.
+    """
+
+    id: strawberry.ID
+    # "services" — extra services were bought — or "nights", the stay grew.
+    kind: str
+    # What was bought. On a nights purchase `services` are the ones already on
+    # the booking, carried on over the new nights.
+    services: List[ExtraServiceType]
+    nights: List[str]
+    nights_count: int
+    # The split of what was charged: accommodation + service_fee + tax + extras
+    # = amount, always. Only a nights purchase has the first three.
+    accommodation: float
+    service_fee: float
+    tax: float
+    extras: float
+    amount: float
+    # How it was paid for — the method, and the masked account/card.
+    payment_method: str
+    payment_reference: str
+    message: str
+    created_at: str
+
+    @classmethod
+    def list_for(cls, booking) -> List["BookingAdditionType"]:
+        return [
+            cls(
+                id=strawberry.ID(str(row.pk)),
+                kind=row.kind,
+                services=[
+                    ExtraServiceType(
+                        name=str(s.get("name", "")),
+                        price=float(s.get("price", 0) or 0),
+                        nights=int(s.get("nights", 0) or 0),
+                        amount=float(s.get("amount", 0) or 0),
+                        carried=bool(s.get("carried")),
+                    )
+                    for s in (row.services or [])
+                    if isinstance(s, dict) and s.get("name")
+                ],
+                nights=[n.isoformat() for n in row.night_dates()],
+                nights_count=int(row.nights_count or 0),
+                accommodation=float(row.accommodation or 0),
+                service_fee=float(row.service_fee or 0),
+                tax=float(row.tax or 0),
+                extras=float(row.extras or 0),
+                amount=float(row.amount or 0),
+                payment_method=row.payment_method or "",
+                payment_reference=row.payment_reference or "",
+                message=row.message or "",
+                created_at=row.created_at.isoformat(),
+            )
+            for row in booking.additions.all()
+        ]
+
+
+@strawberry.type
+class ServiceQuoteType:
+    """
+    What adding a set of extra services to a booking would cost right now,
+    priced by the server with the same code the purchase itself runs (see
+    properties/additions.quote_services).
+
+    `allowed` false means it can't go through and `error` says why — so a
+    selection the server would refuse comes back as a sentence rather than as a
+    button that fails when pressed.
+    """
+
+    services: List[ExtraServiceType]
+    # The nights every one of them is charged over — the stay's remaining
+    # nights, in date order.
+    nights: List[str]
+    nights_count: int
+    amount: float
+    allowed: bool
+    message: str
+    error: str
+
+    @classmethod
+    def from_quote(cls, quote) -> "ServiceQuoteType":
+        return cls(
+            services=[
+                ExtraServiceType(
+                    name=s["name"],
+                    price=float(s["price"]),
+                    nights=int(s["nights"]),
+                    amount=float(s["amount"]),
+                )
+                for s in quote.services
+            ],
+            nights=[n.isoformat() for n in quote.nights],
+            nights_count=quote.nights_count,
+            amount=float(quote.amount),
+            allowed=quote.allowed,
+            message=quote.message,
+            error=quote.error,
+        )
+
+
+@strawberry.type
+class NightsQuoteType:
+    """
+    What extending a booking over a set of dates would cost right now (see
+    properties/additions.quote_nights) — the same arithmetic the checkout ran,
+    on the nights being added, plus the stay's services carried on over them.
+
+    `kept` are nights inside the chosen range the booking ALREADY holds: not a
+    problem and not charged, so dragging across the whole stay to add a day on
+    the end never pays for it twice.
+    """
+
+    nights: List[str]
+    nights_count: int
+    kept: List[str]
+    # Nights inside the range somebody else holds. Skipped rather than refused,
+    # so the stay extends around them — the guest checks out and back in.
+    skipped: List[str]
+    accommodation: float
+    service_fee: float
+    tax: float
+    extras: float
+    services: List[ExtraServiceType]
+    amount: float
+    # What the stay would become.
+    check_in: str
+    check_out: str
+    total_nights: int
+    allowed: bool
+    message: str
+    error: str
+
+    @classmethod
+    def from_quote(cls, quote) -> "NightsQuoteType":
+        return cls(
+            nights=[n.isoformat() for n in quote.nights],
+            nights_count=quote.nights_count,
+            kept=[n.isoformat() for n in quote.kept],
+            skipped=[n.isoformat() for n in quote.skipped],
+            accommodation=float(quote.accommodation),
+            service_fee=float(quote.service_fee),
+            tax=float(quote.tax),
+            extras=float(quote.extras),
+            services=[
+                ExtraServiceType(
+                    name=s["name"],
+                    price=float(s["price"]),
+                    nights=int(s["nights"]),
+                    amount=float(s["amount"]),
+                )
+                for s in quote.services
+            ],
+            amount=float(quote.amount),
+            check_in=quote.check_in.isoformat() if quote.check_in else "",
+            check_out=quote.check_out.isoformat() if quote.check_out else "",
+            total_nights=quote.total_nights,
+            allowed=quote.allowed,
+            message=quote.message,
+            error=quote.error,
+        )
+
+
+@strawberry.type
+class ChangesQuoteType:
+    """
+    Everything being added to a booking in one go, and what it comes to (see
+    properties/additions.quote_changes).
+
+    Both halves are optional and either may be null — what is never optional is
+    that they are priced, and paid for, TOGETHER: a guest adding two nights and
+    breakfast made one decision, and `amount` is the one figure the button
+    charges. If either half can't go through, `allowed` is false and `error`
+    says why, rather than half the purchase happening.
+    """
+
+    services: Optional[ServiceQuoteType]
+    nights: Optional[NightsQuoteType]
+    amount: float
+    allowed: bool
+    message: str
+    error: str
+
+    @classmethod
+    def from_quote(cls, quote) -> "ChangesQuoteType":
+        return cls(
+            services=(
+                ServiceQuoteType.from_quote(quote.services) if quote.services else None
+            ),
+            nights=(
+                NightsQuoteType.from_quote(quote.nights) if quote.nights else None
+            ),
+            amount=float(quote.amount),
+            allowed=quote.allowed,
+            message=quote.message,
+            error=quote.error,
+        )
+
+
+@strawberry.type
+class BookingEditOptionsType:
+    """
+    Everything the "edit booking" screen needs to draw itself, in one round
+    trip: what may still be added to this stay, and the calendar it may be
+    extended over.
+
+    The calendar is this BOOKING's, not the villa's: the nights it already holds
+    are not obstacles to it (`unavailable_dates` leaves them out), and `own
+    _nights` marks them so the picker can show them as already-yours rather than
+    as free dates to buy again.
+    """
+
+    booking_id: strawberry.ID
+    # The villa's extra services this booking doesn't have yet. Empty means the
+    # guest has everything on offer — and the "add a service" door should not be
+    # shown at all rather than opening onto an empty list.
+    available_services: List[ExtraServiceType]
+    # Whether each door is open, and the one sentence explaining a shut one.
+    can_add_services: bool
+    can_add_nights: bool
+    blocked_reason: str
+    # The nights a service bought now would be charged over (the stay's nights
+    # that haven't started), and the nightly rate a new night would cost.
+    chargeable_nights: int
+    price_per_night: float
+    # The methods this host takes, so an addition can be paid for with one of
+    # them rather than only with whatever the booking was paid with.
+    accepted_payments: List[str]
+    # What the booking was paid with, masked — the "use the same card" option.
+    saved_payment_method: str
+    saved_payment_reference: str
+    # --- The calendar ---
+    # The host's rolling window, the dates inside it that somebody else has, and
+    # the nights this booking itself holds.
+    first_date: str
+    last_date: str
+    max_check_out: str
+    unavailable_dates: List[str]
+    own_nights: List[str]
+    check_in_time: str
+    server_now: str
+
+    @classmethod
+    def from_booking(cls, booking, now=None) -> "BookingEditOptionsType":
+        from properties import additions as addons
+
+        now = now or timezone.now()
+        villa = booking.villa
+        blocked = addons.blocked_reason(booking, now)
+        offered = booking.available_extra_services()
+        chargeable = len(booking.unstarted_nights(now))
+        return cls(
+            booking_id=strawberry.ID(str(booking.pk)),
+            available_services=[
+                ExtraServiceType(name=s["name"], price=float(s["price"]))
+                for s in offered
+            ],
+            can_add_services=bool(not blocked and offered and chargeable),
+            can_add_nights=not blocked,
+            blocked_reason=blocked,
+            chargeable_nights=chargeable,
+            price_per_night=float(booking.price_per_night or villa.price_per_night or 0),
+            accepted_payments=[
+                str(p).strip() for p in (villa.accepted_payments or []) if str(p).strip()
+            ],
+            saved_payment_method=booking.payment_method or "",
+            saved_payment_reference=booking.card_last4 or "",
+            first_date=availability.first_bookable_date(villa, now).isoformat(),
+            last_date=availability.last_bookable_date(villa, now).isoformat(),
+            max_check_out=availability.window_end(villa, now).isoformat(),
+            unavailable_dates=[
+                d.isoformat()
+                for d in availability.unavailable_dates(
+                    villa, now, for_guest=booking.guest, exclude_booking_id=booking.pk
+                )
+            ],
+            own_nights=[d.isoformat() for d in sorted(booking.occupied_nights())],
+            check_in_time=_hhmm(availability.check_in_cutoff(villa)),
+            server_now=timezone.localtime(now).strftime("%Y-%m-%dT%H:%M"),
+        )
 
 
 @strawberry.type
@@ -327,6 +639,12 @@ class NightsCancellationQuoteType:
     cancellation_fee: float
     refund_amount: float
     refund_percentage: int
+    # Of `stay_value`, what was extra services on those nights. Refunded IN
+    # FULL, whatever the ladder charges on the stay itself — the host was going
+    # to do something on a night that is no longer happening, so there is
+    # nothing to keep a percentage of. Already inside `refund_amount`; named
+    # separately so the summary can show why the refund beats the tier.
+    extras_value: float
     # True when the selection is every night still held: this is a whole-stay
     # cancellation, and the UI should say so rather than "3 nights".
     full: bool
@@ -343,6 +661,7 @@ class NightsCancellationQuoteType:
             cancellation_fee=float(quote.penalty_amount),
             refund_amount=float(quote.refund_amount),
             refund_percentage=int(quote.refund_percentage),
+            extras_value=float(quote.extras_value),
             full=quote.full,
             allowed=quote.allowed,
             message=quote.message,
@@ -711,6 +1030,12 @@ class BookingType:
     # and `nights` counts what was slept, not the days between them.
     segments: List[StaySegmentType]
     guests: int
+    # What the host counted through the door, against what the villa sleeps.
+    # `checked_in_guests` is 0 until an arrival is verified — `guests` above is
+    # only what was booked — and `guest_capacity` is the ceiling the check-in
+    # dialog offers and the server enforces (see checkin.headcount).
+    checked_in_guests: int
+    guest_capacity: int
     price_per_night: float
     subtotal: float
     discount: float
@@ -800,6 +1125,19 @@ class BookingType:
     cancellations: List[BookingCancellationType]
     refunded_total: float
 
+    # --- Growing a stay that's already paid for (properties/additions.py) ---
+    # The mirror of the block above: a booking can be added to as well as cut
+    # back. `available_services` are the villa's add-ons this booking doesn't
+    # have yet — empty is what HIDES the "add a service" option rather than
+    # opening an empty picker — and the two flags say whether either door is
+    # open at all (both shut on a cancelled or finished stay).
+    available_services: List[ExtraServiceType]
+    can_add_services: bool
+    can_add_nights: bool
+    # One receipt per purchase made after booking, oldest first, and their sum.
+    additions: List[BookingAdditionType]
+    additions_total: float
+
     # --- Check-in window (see Booking.check_in_gate) ---
     # The host's button, as the server sees it: whether it shows at all, what
     # colour it is ("grey" before the hour, "green" inside the window, "yellow"
@@ -836,6 +1174,24 @@ class BookingType:
     # 0 / false until it happens.
     early_check_out: bool
     released_nights: int
+
+    # --- Forced check-out (see checkin.sync_forced_check_out) ---
+    # The stay closes itself half an hour after the hour the guest had to be
+    # out. `checkout_overdue` is that half hour running: the hour has passed
+    # with nobody checked out. `auto_check_out_at` is when it closes — naive
+    # wall-clock, like check_out_at, so it compares directly to `server_now` —
+    # and `auto_check_out_seconds_left` is the same thing already counted, so
+    # neither side has to do date arithmetic to draw the countdown. Both are
+    # "" / 0 whenever there is nothing pending.
+    #
+    # `forced_check_out` says it has already happened: this departure was the
+    # platform's, on the clock, with no PIN — which is a different fact about
+    # the stay than `checked_out_at`, and the one a disputed departure turns on.
+    checkout_overdue: bool
+    auto_check_out_at: str
+    auto_check_out_seconds_left: int
+    forced_check_out: bool
+    forced_check_out_at: str
 
     # --- Stay PINs ---
     # `checkin_pin` / `checkout_pin` — the digits — are filled in for the GUEST
@@ -887,6 +1243,14 @@ class BookingType:
                 booking.pk, booking.villa_id, booking.guest_id,
                 booking.no_show_at.isoformat(),
             )
+        # And the other end of the stay, on the same terms: a departure nobody
+        # recorded is closed here, half an hour past the hour the guest had to
+        # be out (see checkin.sync_forced_check_out). BEFORE the gates below are
+        # read, so this booking is described as the closed stay it now is
+        # rather than as one still waiting on a PIN.
+        checkin.sync_forced_check_out(booking, now=now)
+        # Read after that sync, so a stay just closed reports no countdown.
+        auto_out_at = booking.auto_check_out_at(now)
         gate = booking.check_in_gate(now)
         out_gate = booking.check_out_gate(now)
         cancelled = booking.status == booking.STATUS_CANCELLED
@@ -897,6 +1261,13 @@ class BookingType:
         cancel_rows = list(booking.cancellations.all())
         cancelled_nights = booking.cancelled_nights()
         cancellable_nights = booking.cancellable_nights(now)
+        # And the same for the other direction: what has been ADDED since, and
+        # whether anything more may be. A stay can only grow while it still has
+        # nights ahead of it — see properties/additions.blocked_reason, which is
+        # what the mutations enforce and this only mirrors.
+        addition_rows = list(booking.additions.all())
+        unstarted = booking.unstarted_nights(now)
+        can_add = not cancelled and not booking.stay_over(now)
 
         # The live check-in PIN, if there is one. Which of its fields are filled
         # in depends entirely on who is asking: the digits go to the guest and
@@ -969,6 +1340,8 @@ class BookingType:
             nights=booking.nights,
             segments=StaySegmentType.list_for(booking),
             guests=booking.guests,
+            checked_in_guests=int(booking.checked_in_guests or 0),
+            guest_capacity=booking.guest_capacity(),
             price_per_night=float(booking.price_per_night),
             subtotal=float(booking.subtotal),
             discount=float(booking.discount),
@@ -981,7 +1354,19 @@ class BookingType:
             service_fee=float(booking.service_fee),
             tax=float(booking.tax),
             extra_services=[
-                ExtraServiceType(name=s.get("name", ""), price=float(s.get("price", 0) or 0))
+                ExtraServiceType(
+                    name=s.get("name", ""),
+                    price=float(s.get("price", 0) or 0),
+                    # What this one was actually charged over. A service ticked
+                    # at checkout ran the whole stay; one bought later runs from
+                    # the night it was bought (see Booking.service_nights).
+                    nights=booking.service_nights(s),
+                    amount=float(
+                        (Decimal(str(s.get("price", 0) or 0)) * booking.service_nights(s)).quantize(
+                            Decimal("0.01")
+                        )
+                    ),
+                )
                 for s in (booking.extra_services or [])
                 if isinstance(s, dict) and s.get("name")
             ],
@@ -1039,6 +1424,21 @@ class BookingType:
             partially_cancelled=bool(cancelled_nights) and not cancelled,
             cancellations=BookingCancellationType.list_for(booking),
             refunded_total=float(booking.refunded_total()),
+            # What may still be added, decided the same way the mutation will
+            # decide it — a shut door is never drawn as an open one. Both are
+            # false on a cancelled stay and on one every part of which is over.
+            available_services=[
+                ExtraServiceType(name=s["name"], price=float(s["price"]))
+                for s in (booking.available_extra_services() if can_add else [])
+            ],
+            can_add_services=bool(
+                can_add and booking.available_extra_services() and unstarted
+            ),
+            can_add_nights=can_add,
+            additions=BookingAdditionType.list_for(booking),
+            additions_total=float(
+                sum((Decimal(str(r.amount or 0)) for r in addition_rows), Decimal("0"))
+            ),
             booking_status=gate.booking_status,
             checkin_available=gate.checkin_available,
             button_state=gate.button_state,
@@ -1057,6 +1457,22 @@ class BookingType:
             # departure that already took place.
             early_check_out=booking.released_nights > 0,
             released_nights=int(booking.released_nights or 0),
+            # The overrun, and the clock on it. `auto_check_out_at` is naive
+            # like the scheduled hours above — it is a time at the PROPERTY, and
+            # a browser in another zone must not shift it.
+            checkout_overdue=booking.check_out_overdue(now),
+            auto_check_out_at=(
+                timezone.localtime(auto_out_at).replace(tzinfo=None).isoformat()
+                if auto_out_at
+                else ""
+            ),
+            auto_check_out_seconds_left=booking.auto_check_out_seconds_left(now),
+            forced_check_out=booking.forced_check_out_at is not None,
+            forced_check_out_at=(
+                booking.forced_check_out_at.isoformat()
+                if booking.forced_check_out_at
+                else ""
+            ),
             # The digits, to the guest alone (see the field comments above).
             checkin_pin=(pin_row.pin if pin_row and is_guest else ""),
             checkin_pin_expires_in=(pin_row.seconds_left(now) if pin_row else 0),
@@ -1085,6 +1501,91 @@ class BookingType:
                 else ""
             ),
         )
+
+
+@strawberry.type
+class SavedPaymentType:
+    """
+    A way this guest has paid before, offered back to them at checkout.
+
+    Only ever the MASKED reference and the billing address that went with it —
+    the card number and CVV were never stored in the first place (see
+    mutations._mask_account), so there is nothing here to leak and nothing to
+    re-enter. Choosing one is choosing "the same as last time"; the server looks
+    the details up again from the guest's own bookings rather than trusting
+    anything the page sends back.
+    """
+
+    method: str
+    reference: str
+    billing_street: str
+    billing_apartment: str
+    billing_city: str
+    billing_state: str
+    billing_zip: str
+    billing_country: str
+    # When it was last used, ISO — what orders the list.
+    last_used: str
+
+    @classmethod
+    def list_for(cls, user) -> List["SavedPaymentType"]:
+        from properties.models import Booking as _Booking
+
+        rows = (
+            _Booking.objects.filter(guest=user)
+            .exclude(payment_method="")
+            .exclude(card_last4="")
+            .order_by("-created_at")
+        )
+        out, seen = [], set()
+        for row in rows:
+            key = (row.payment_method, row.card_last4)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                cls(
+                    method=row.payment_method,
+                    reference=row.card_last4,
+                    billing_street=row.billing_street or "",
+                    billing_apartment=row.billing_apartment or "",
+                    billing_city=row.billing_city or "",
+                    billing_state=row.billing_state or "",
+                    billing_zip=row.billing_zip or "",
+                    billing_country=row.billing_country or "",
+                    last_used=row.created_at.isoformat(),
+                )
+            )
+        return out
+
+
+@strawberry.input
+class AddonPaymentInput:
+    """
+    How an addition to an existing booking is paid for.
+
+    Same shape as the payment half of `BookingInput`, because it is the same
+    payment: the host's accepted methods, a card with its billing address or an
+    account handle, validated by the same code (see mutations._resolve_payment).
+
+    `use_saved` is the one thing checkout has no need of — the guest already
+    paid for this stay once, and paying for an addition the same way should not
+    mean typing a card number again. It reuses the booking's own method and its
+    masked reference, and nothing else on this input is read.
+    """
+
+    use_saved: bool = False
+    payment_method: str = ""
+    card_number: str = ""
+    expiration: str = ""
+    cvv: str = ""
+    payment_detail: str = ""
+    billing_street: str = ""
+    billing_apartment: str = ""
+    billing_city: str = ""
+    billing_state: str = ""
+    billing_zip: str = ""
+    billing_country: str = ""
 
 
 @strawberry.input
@@ -1117,6 +1618,11 @@ class BookingInput:
     # Optional discount code. Re-validated and applied on the server; an invalid
     # or non-applicable code fails the booking rather than silently costing full.
     coupon_code: str = ""
+    # Pay the way this guest paid before: the method named above is looked up
+    # against their own past bookings and its masked reference and billing
+    # address reused, so they don't retype a card the platform never kept
+    # anyway. The card fields above are ignored when this is set.
+    use_saved_payment: bool = False
     # Names of the extra services the guest ticked. Prices are looked up from the
     # villa on the server (never trusted from the client).
     extra_services: List[str] = strawberry.field(default_factory=list)
