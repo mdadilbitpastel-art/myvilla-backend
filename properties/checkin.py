@@ -10,6 +10,13 @@ and a check-out is evidence they were there to leave.
 Both ends of the stay work the same way, and `purpose` is the only thing that
 separates them: a code issued for an arrival is never accepted for a departure.
 
+The one deliberate exception is a departure at or past its booked hour. The
+check-out code exists to stop a host putting a guest out EARLY, and once that
+hour is behind us it protects nothing: the host closes the stay in one press
+(`check_out_without_pin`), and if nobody does, the platform closes it half an
+hour later on its own (`sync_forced_check_out`). Both are recorded as what they
+are — the audit trail names the host or names the platform.
+
 Everything about that is deliberately narrow:
 
 * the PIN lives one minute and works once — an old code can never be replayed;
@@ -93,6 +100,15 @@ def issue_pin(booking, *, purpose=CHECK_IN, actor=None, now=None) -> CheckInVeri
     available, message = _gate(booking, purpose, now)
     if not available:
         raise CheckInError(message)
+    # Past the booked hour a departure needs no code (see
+    # Booking.check_out_pin_required), so there is nothing to issue: minting one
+    # would put a PIN on the guest's page for a step neither side has to take,
+    # and the guest has very likely already left.
+    if purpose == CHECK_OUT and not booking.check_out_pin_required(now):
+        raise CheckInError(
+            "The booked check-out time has passed — no PIN is needed. Press "
+            "Check out to close this stay."
+        )
 
     with transaction.atomic():
         # Supersede any live PIN, whatever it was for. Only one code is ever
@@ -312,6 +328,54 @@ def _record_departure(booking, now) -> int:
         booking.checked_out_at = now
         fields.append("checked_out_at")
     booking.save(update_fields=fields)
+    return released
+
+
+def check_out_without_pin(booking, *, actor=None, now=None) -> int:
+    """
+    Close a stay whose booked check-out hour has passed, on the host's say-so
+    and without a code.
+
+    The middle ground between the two things that already existed: before the
+    hour a departure needs the guest's PIN, and half an hour after it the
+    platform closes the stay itself. In between, the host pressing Check out is
+    recording something that is already true — the hour is up, the guest owes
+    the property nothing more, and the only alternative on offer is waiting for
+    the clock to do the identical thing with nobody's name on it. A host who is
+    standing in the empty villa should not need to phone a guest who has left in
+    order to say so.
+
+    Refused while the hour is still ahead: that is precisely the case the PIN
+    exists for, and this is not a way around it.
+
+    Returns the nights released — always 0 here, since a departure at or past
+    the booked hour has no unused nights to hand back. Kept as the return value
+    so this reads the same way as `_record_departure` for its callers.
+    """
+    now = now or timezone.now()
+
+    gate = booking.check_out_gate(now)
+    if not gate.available:
+        raise CheckInError(gate.message)
+    if booking.check_out_pin_required(now):
+        raise CheckInError(
+            "The booked check-out time hasn't passed yet — ask the guest for "
+            "the 4-digit PIN on their booking to check them out now."
+        )
+
+    with transaction.atomic():
+        # Any live departure code dies with the stay it was for. Leaving one
+        # breathing would be a code that outlives the thing it proves, and the
+        # guest is still looking at it on their own booking page.
+        CheckInVerification.objects.filter(
+            booking=booking,
+            purpose=CHECK_OUT,
+            verified_at__isnull=True,
+            invalidated_at__isnull=True,
+        ).update(invalidated_at=now)
+        released = _record_departure(booking, now)
+
+    _audit("check_out_no_pin", booking, actor=actor, released_nights=released or None)
     return released
 
 

@@ -624,6 +624,9 @@ class Booking(models.Model):
                 "checked_in_at": self._parse_stamp(raw.get("checked_in_at")),
                 "checked_out_at": self._parse_stamp(raw.get("checked_out_at")),
                 "guests": self._parse_count(raw.get("guests")),
+                # Split off a part the guest had already begun (see drop_nights):
+                # nobody has arrived for THIS run, but the money on it is spent.
+                "under_way": bool(raw.get("under_way")),
             }
         # A stay that predates per-part stamps (or was never split) carries its
         # arrival and departure on the booking itself — that IS part one's.
@@ -632,6 +635,7 @@ class Booking(models.Model):
                 "checked_in_at": self.checked_in_at,
                 "checked_out_at": self.checked_out_at,
                 "guests": self.checked_in_guests,
+                "under_way": False,
             }
         return out
 
@@ -801,6 +805,25 @@ class Booking(models.Model):
         if part is None or part["checked_in_at"] is None:
             return False
         return now >= part["ends_at"]
+
+    def check_out_pin_required(self, now=None) -> bool:
+        """
+        Whether the host still has to be told the guest's PIN to close this
+        stay.
+
+        The departure code exists for exactly one reason: to stop a host putting
+        a guest out BEFORE the hour they paid to stay until. Once that hour has
+        passed there is nothing left for it to protect — the guest owes the
+        property nothing more, and the platform is itself going to close the
+        stay half an hour later without asking anybody (see
+        `sync_forced_check_out`). Demanding a code in between would only mean a
+        host who is standing in an empty villa can't record what plainly already
+        happened, while the clock ends up recording it for them.
+
+        So: PIN before the hour, no PIN after it. The same reading the forced
+        check-out is built on, asked one step earlier.
+        """
+        return not self.check_out_overdue(now)
 
     def scheduled_grace_minutes(self) -> int:
         """How long after check-in time the host may still take this guest in:
@@ -1057,16 +1080,16 @@ class Booking(models.Model):
             )
         # Past the hour, the PIN stops being the point. It was only ever there
         # to stop a host putting a guest out early, and that can no longer
-        # happen — so what both sides need to be told is not how to check out
-        # but that the platform is about to do it for them.
+        # happen — so the host can close this in one press, and what they need
+        # to be told is what happens if they don't.
         if self.check_out_overdue(now):
             due_at = self.auto_check_out_at(now)
             when = timezone.localtime(due_at).strftime("%I:%M %p").lstrip("0").lower()
             return gate(
                 True,
                 (
-                    "The booked check-out time has passed. This stay closes "
-                    f"automatically at {when} — no PIN needed once it does."
+                    "The booked check-out time has passed, so no PIN is needed — "
+                    f"you can close this stay now. Left alone it closes itself at {when}."
                 ),
             )
         return gate(
@@ -1168,12 +1191,11 @@ class Booking(models.Model):
     # nights are priced out of the stay, refunded under the same clock rule as a
     # whole cancellation, and handed straight back to the villa's calendar.
     #
-    # The nights that CAN go are the ones at the edges. A stay is a run of nights
-    # the guest is physically present for, so dropping one out of the middle
-    # would mean packing up, leaving and coming back — this refuses it and says
-    # so, exactly as an OTA does. Trimming either end (or giving up a whole later
-    # part of a split stay) is free of that problem and is what the picker
-    # offers.
+    # Any night that hasn't started may go, on its own, wherever it sits. One
+    # taken out of the middle does mean packing up, leaving and coming back —
+    # so the stay splits in two there, which is the shape a stay booked around
+    # another guest's nights already has and is lived exactly the same way: check
+    # out before the gap, check back in after it on a fresh PIN.
     #
     # A stay ALREADY UNDER WAY is trimmed the same way. The night the guest is
     # sleeping in is theirs and is gone, but the nights after it haven't happened
@@ -1182,6 +1204,13 @@ class Booking(models.Model):
     # gets to leave early on the books rather than in silence. That is the same
     # bargain an early check-out strikes (nights freed, nothing refunded), so a
     # begun part prices at 0% rather than disappearing from the picker.
+    #
+    # And it goes on pricing at 0% after a split. The ladder is judged at a
+    # part's ARRIVAL, so a run broken off a begun part would otherwise open in
+    # the future and read as refundable — a guest could hand back one night at
+    # 0% and buy back the ladder on all the nights behind it. `under_way` is the
+    # mark that says a run came off a part the guest had already begun, and it
+    # keeps that run non-refundable for as long as it exists.
 
     MSG_NIGHT_STARTED = (
         "That night has already begun — it's yours, and it can't be given back. "
@@ -1194,10 +1223,6 @@ class Booking(models.Model):
     MSG_ARRIVAL_PASSED = (
         "Check-in for this part of the stay has already passed, so nothing is "
         "refunded for these nights — they simply go back on the calendar."
-    )
-    MSG_MIDDLE_NIGHT = (
-        "Nights in the middle of a stay can't be given up on their own — you'd "
-        "have to leave and come back. Choose nights at the start or the end."
     )
     MSG_NOT_BOOKED = "Those nights aren't part of this booking."
     MSG_NO_NIGHTS = "Choose at least one night to cancel."
@@ -1394,10 +1419,18 @@ class Booking(models.Model):
             if stay.get("checked_out_at"):
                 continue
             arrived = bool(arrived_at)
-            begun = arrived or now >= opens_at
+            # `under_way`: this run was broken off a part the guest had already
+            # begun, so its money is spent even though its own arrival is still
+            # ahead — see the note above MSG_NIGHT_STARTED.
+            carried = bool(stay.get("under_way"))
+            begun = arrived or carried or now >= opens_at
             if begun:
                 percentage = self.REFUND_AFTER_CHECK_IN
-                message = self.MSG_STAY_UNDER_WAY if arrived else self.MSG_ARRIVAL_PASSED
+                message = (
+                    self.MSG_STAY_UNDER_WAY
+                    if arrived or carried
+                    else self.MSG_ARRIVAL_PASSED
+                )
             else:
                 # Not begun, so the arrival is still ahead and the ladder always
                 # settles on a band — `None` is unreachable here.
@@ -1440,9 +1473,9 @@ class Booking(models.Model):
     def cancellable_nights(self, now=None) -> list:
         """Every night the guest could still choose to give up, in date order.
 
-        Every night that hasn't started, whatever part it sits in — which of
-        them may go TOGETHER is a question about the selection (no holes), and
-        that is the quote's to answer, not this list's.
+        Every night that hasn't started, whatever part it sits in. Each stands
+        on its own: any of them may go without its neighbours, and what that
+        leaves behind — one run or two — is the cancellation's to reshape.
         """
         if self.status == self.STATUS_CANCELLED:
             return []
@@ -1645,8 +1678,11 @@ class Booking(models.Model):
         Price and check a set of nights the guest wants to give up.
 
         Refused, with `error` saying why, when the selection isn't this
-        booking's to give up, belongs to a stay already under way, or would
-        leave a hole in the middle of one. Otherwise every chosen night is
+        booking's to give up or has already begun. Nights are chosen one at a
+        time and need not sit together: handing back one out of the middle
+        simply breaks that part into the two runs either side of it, the same
+        shape a stay booked around another guest's nights already has.
+        Otherwise every chosen night is
         priced at its share of the total and refunded at ITS OWN part's tier —
         a split stay can perfectly well be free to trim at the far end while
         the part starting tonight is already non-refundable, and this adds the
@@ -1691,18 +1727,12 @@ class Booking(models.Model):
                 return refuse(self.MSG_NIGHT_STARTED)
             by_part.setdefault(index, []).append(night)
 
-        # No holes: what's left of a part has to stay one unbroken run, because
-        # that is what a guest can actually live in.
-        for index, part_nights in by_part.items():
-            start, end = self.stay_segments()[index - 1]
-            kept = []
-            night = start
-            while night < end:
-                if night not in set(part_nights):
-                    kept.append(night)
-                night += timedelta(days=1)
-            if kept and (kept[-1] - kept[0]).days + 1 != len(kept):
-                return refuse(self.MSG_MIDDLE_NIGHT)
+        # A night out of the middle is allowed, and needs nothing said here:
+        # `drop_nights` rewrites the part as the two runs either side of it, and
+        # two runs with somebody else's nights between them is exactly what a
+        # split stay already is — lived in instalments, each part checked into
+        # on its own PIN. So the guest may hand back any night they haven't
+        # started, one at a time, and the stay reshapes around the choice.
 
         empties = set(chosen) >= held
         stay_value = self.nights_value(chosen, empties=empties)
@@ -1752,7 +1782,7 @@ class Booking(models.Model):
             extras_value=extras_value,
         )
 
-    def drop_nights(self, nights) -> None:
+    def drop_nights(self, nights, now=None) -> None:
         """
         Take `nights` out of the stay, in place. Caller saves.
 
@@ -1764,37 +1794,71 @@ class Booking(models.Model):
         bounds of what was BOOKED, frozen beside the money, and the gap between
         them and the segments is the record of what was given up.
 
-        Per-part arrival stamps are re-keyed when a whole part disappears, so
-        the parts that remain keep their own history rather than inheriting the
-        stamps of a part that no longer exists.
+        A part can come out of this as more than one run: a night taken from its
+        middle leaves the nights either side of it, and those are two runs now.
+        Per-part history is re-keyed onto them — the arrival stamps stay with the
+        run the guest actually arrived for, and every run off a part that had
+        already begun is marked `under_way`, so the money that was spent on
+        those nights stays spent however late their new arrival looks.
         """
+        now = now or timezone.now()
         drop = set(nights)
         old_runs = self.stay_segments()
         stays = self.part_stays()
-        runs, index_map = [], {}
+        # Every new run each old part broke into, in order — the first is the one
+        # the part's own history belongs to.
+        runs, born = [], {}
         for index, (start, end) in enumerate(old_runs, start=1):
             night, run_start = start, None
             while night < end:
                 if night in drop:
                     if run_start is not None:
                         runs.append((run_start, night))
-                        index_map.setdefault(index, len(runs))
+                        born.setdefault(index, []).append(len(runs))
                         run_start = None
                 elif run_start is None:
                     run_start = night
                 night += timedelta(days=1)
             if run_start is not None:
                 runs.append((run_start, end))
-                index_map.setdefault(index, len(runs))
+                born.setdefault(index, []).append(len(runs))
         self.segments = [
             {"check_in": a.isoformat(), "check_out": b.isoformat()} for a, b in runs
         ]
-        if stays:
-            self.segment_stays = [
-                {"index": index_map[old], **{k: v.isoformat() for k, v in stay.items() if v}}
-                for old, stay in sorted(stays.items())
-                if old in index_map
-            ]
+
+        rows = []
+        for index, (start, _end) in enumerate(old_runs, start=1):
+            new_indexes = born.get(index)
+            if not new_indexes:
+                # The whole part went. Its history goes with it rather than
+                # being inherited by a part that isn't it.
+                continue
+            stay = stays.get(index, {})
+            # Had this part begun? Then so has every run left of it — including
+            # the first, whose start may itself have moved later.
+            begun = bool(
+                stay.get("checked_in_at")
+                or stay.get("under_way")
+                or now >= self._aware(
+                    datetime.combine(start, self.scheduled_check_in_time())
+                )
+            )
+            head = {"index": new_indexes[0]}
+            for key in ("checked_in_at", "checked_out_at"):
+                if stay.get(key):
+                    head[key] = stay[key].isoformat()
+            if stay.get("guests"):
+                head["guests"] = stay["guests"]
+            if begun:
+                head["under_way"] = True
+            if len(head) > 1:
+                rows.append(head)
+            # The runs behind the gap: nobody has arrived for them and nobody
+            # has left them, but they are what remains of a stay under way.
+            for tail in new_indexes[1:]:
+                if begun:
+                    rows.append({"index": tail, "under_way": True})
+        self.segment_stays = rows
 
     def apply_nights_cancellation(self, quote, now=None):
         """
@@ -1846,7 +1910,7 @@ class Booking(models.Model):
             # blocks nothing (occupancy counts active bookings only), and it
             # stays the record of the nights that were held.
         else:
-            self.drop_nights(quote.nights)
+            self.drop_nights(quote.nights, now)
             fields += ["segments", "segment_stays"]
         self.save(update_fields=fields)
         return record
@@ -2012,6 +2076,13 @@ class Booking(models.Model):
                     if current is None
                     else (min(current, value) if key == "checked_in_at" else max(current, value))
                 )
+            if stay.get("guests"):
+                row["guests"] = max(int(row.get("guests") or 0), int(stay["guests"]))
+            # Nights bought back around a run that was under way don't undo that:
+            # the run is still what's left of a stay already begun, so it stays
+            # non-refundable (see `drop_nights`).
+            if stay.get("under_way"):
+                row["under_way"] = True
 
         self.check_in = min(runs[0][0], self.check_in)
         self.check_out = max(runs[-1][1], self.check_out)
@@ -2029,7 +2100,13 @@ class Booking(models.Model):
         )
         if merged:
             self.segment_stays = [
-                {"index": index, **{k: v.isoformat() for k, v in row.items()}}
+                {
+                    "index": index,
+                    **{
+                        key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                        for key, value in row.items()
+                    },
+                }
                 for index, row in sorted(merged.items())
             ]
 

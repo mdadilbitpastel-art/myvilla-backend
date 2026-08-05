@@ -1052,6 +1052,7 @@ class PropertyMutation:
         services: Optional[List[str]] = None,
         check_in: Optional[str] = None,
         check_out: Optional[str] = None,
+        nights: Optional[List[str]] = None,
     ) -> BookingType:
         """
         Add extra services, more nights, or BOTH to one of the current user's
@@ -1070,6 +1071,11 @@ class PropertyMutation:
         villa's own list; nights must be free, inside the host's window, still
         ahead of the guest and joined to the stay. Nights the booking already
         holds are kept and not charged for.
+
+        Nights arrive as a range (`check_in`/`check_out` — "extend up to here")
+        and/or as `nights`, an explicit list, which is how a guest takes back
+        single nights they had given up from inside their own span. Both are
+        unioned and charged as one purchase.
         """
         booking = _own_booking(info, id)
         now = timezone.now()
@@ -1082,6 +1088,7 @@ class PropertyMutation:
                 services or [],
                 availability.parse_date(check_in),
                 availability.parse_date(check_out),
+                availability.parse_dates(nights),
                 now,
             )
             if not quote.allowed:
@@ -1189,6 +1196,11 @@ class PropertyMutation:
     # 4-digit PIN that appears only on the GUEST's booking page, and the host has
     # to be told it. A host cannot close a stay — and cannot free up the nights a
     # guest leaves early — without the guest being there to read the code out.
+    #
+    # …up to the booked check-out hour, and not one step past it. From that hour
+    # the code has nothing left to protect and `checkOutNow` closes the stay in
+    # one press (see Booking.check_out_pin_required); half an hour later the
+    # platform closes it whether anybody pressed anything or not.
 
     @strawberry.mutation
     def start_check_out(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
@@ -1229,6 +1241,24 @@ class PropertyMutation:
                 pin,
                 purpose=checkin.CHECK_OUT,
                 actor=require_authenticated_user(info),
+            )
+        except checkin.CheckInError as exc:
+            raise GraphQLError(str(exc))
+        return BookingType.from_model(booking, request=info.context.request)
+
+    @strawberry.mutation
+    def check_out_now(self, info: strawberry.Info, id: strawberry.ID) -> BookingType:
+        """
+        Close a stay whose booked check-out hour has passed — one press, no PIN.
+
+        Refused while that hour is still ahead: checking a guest out early is
+        exactly what the code exists to stop, and this is not a way around it.
+        See checkin.check_out_without_pin.
+        """
+        booking = _owned_booking(info, id)
+        try:
+            checkin.check_out_without_pin(
+                booking, actor=require_authenticated_user(info)
             )
         except checkin.CheckInError as exc:
             raise GraphQLError(str(exc))

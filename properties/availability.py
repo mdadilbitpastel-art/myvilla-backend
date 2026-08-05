@@ -44,6 +44,13 @@ def parse_date(value: Optional[str]) -> Optional[date]:
         return None
 
 
+def parse_dates(values) -> list:
+    """A list of ISO dates from the client, in order, with the unreadable ones
+    dropped — the same forgiveness `parse_date` shows a single one."""
+    out = {parse_date(raw) for raw in (values or [])}
+    return sorted(d for d in out if d is not None)
+
+
 def normalise_range(check_in: Optional[date], check_out: Optional[date]):
     """
     Settle the window availability is judged over.

@@ -313,6 +313,7 @@ class PropertyQuery:
         services: Optional[List[str]] = None,
         check_in: Optional[str] = None,
         check_out: Optional[str] = None,
+        nights: Optional[List[str]] = None,
     ) -> ChangesQuoteType:
         """
         What everything the guest is adding to their own booking would cost —
@@ -322,6 +323,9 @@ class PropertyQuery:
         bought together: a service added alongside two extra nights runs over
         those nights too, which is not something the two halves could work out
         separately. Safe to call on every tick of the picker.
+
+        `nights` are dates picked one at a time — how a guest takes back single
+        nights they had given up — and are added to whatever the range covers.
         """
         return ChangesQuoteType.from_quote(
             addons.quote_changes(
@@ -329,6 +333,7 @@ class PropertyQuery:
                 services or [],
                 availability.parse_date(check_in),
                 availability.parse_date(check_out),
+                availability.parse_dates(nights),
                 timezone.now(),
             )
         )
@@ -432,6 +437,32 @@ class PropertyQuery:
         """
         user = require_authenticated_user(info)
         return Villa.objects.filter(owner=user).count()
+
+    @strawberry.field
+    def my_bookings_count(self, info: strawberry.Info) -> int:
+        """
+        How many stays the current user has booked. The counterpart of
+        `my_villas_count`, and asked for in the same breath: the account
+        sidebar marks a section that has nothing in it yet ("No bookings yet"),
+        and it must be able to say that without pulling every booking the user
+        has ever made just to look at the length of the list.
+        """
+        user = require_authenticated_user(info)
+        return Booking.objects.filter(guest=user).count()
+
+    @strawberry.field
+    def my_villa_bookings_count(self, info: strawberry.Info) -> int:
+        """How many rent requests the current user has received, across every
+        villa they own. Same purpose as the two counts above: the sidebar marks
+        an empty section without loading the section."""
+        user = require_authenticated_user(info)
+        return Booking.objects.filter(villa__owner=user).count()
+
+    @strawberry.field
+    def my_coupons_count(self, info: strawberry.Info) -> int:
+        """How many discount codes the current user has created."""
+        user = require_authenticated_user(info)
+        return Coupon.objects.filter(owner=user).count()
 
     @strawberry.field
     def my_coupons(self, info: strawberry.Info) -> List[CouponType]:

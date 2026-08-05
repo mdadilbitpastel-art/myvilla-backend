@@ -44,6 +44,10 @@ MSG_NO_NIGHTS_LEFT = (
     "Every night of this stay has already begun, so there is nothing left to "
     "add a service to."
 )
+MSG_AWAITING_ARRIVAL = (
+    "Check-in time has passed, so this stay can't be changed until you've "
+    "checked in. Check in first and you can add to it from there."
+)
 
 
 def _money(value) -> Decimal:
@@ -58,16 +62,25 @@ def blocked_reason(booking: Booking, now=None) -> str:
     """
     Why this booking can't be added to at all, or "" when it can.
 
-    Two doors are shut: a cancelled booking is not a stay any more, and a stay
-    every part of which is behind us has nothing left to sell. Everything else
-    — upcoming, under way, even a stay whose first part is finished — is open,
-    because there are still nights ahead to deliver on.
+    Three doors are shut. A cancelled booking is not a stay any more, and a stay
+    every part of which is behind us has nothing left to sell.
+
+    The third is the hour the guest is due. Up to it they are still planning a
+    trip and may change it freely. On it the door shuts, arrived or not, because
+    a stay whose check-in hour has passed with nobody in it is not yet anything
+    to add to — the host is standing at the door, the grace period is running,
+    and what this booking turns out to be is still open. Checking in settles it,
+    and the door opens again on the part in front of the guest: a split stay has
+    later parts to edit, an unbroken one has an end to extend.
     """
     now = now or timezone.now()
     if booking.status == Booking.STATUS_CANCELLED:
         return MSG_CANCELLED
-    if booking.stay_over(now):
+    part = booking.current_part(now)
+    if part is None:
         return MSG_STAY_OVER
+    if part["checked_in_at"] is None and now >= part["opens_at"]:
+        return MSG_AWAITING_ARRIVAL
     return ""
 
 
@@ -253,9 +266,23 @@ def _runs(nights) -> list:
     return runs
 
 
-def quote_nights(booking: Booking, check_in: date, check_out: date, now=None) -> NightsQuote:
+def quote_nights(
+    booking: Booking,
+    check_in: Optional[date] = None,
+    check_out: Optional[date] = None,
+    nights=(),
+    now=None,
+) -> NightsQuote:
     """
-    Price extending `booking` over [check_in, check_out), at the server's clock.
+    Price adding nights to `booking`, at the server's clock.
+
+    The nights come in two ways, and either or both may be used. `check_in` /
+    `check_out` are a RANGE — "extend my stay up to here" — and every free night
+    inside it is taken. `nights` is an explicit LIST, which is how a guest picks
+    back single nights they had given up: those sit inside the stay's own span
+    with nights kept either side of them, so a range could not name one without
+    naming its neighbours too. The two are simply unioned before anything below
+    looks at them.
 
     The rules are the ones the villa already lives by, asked again for a stay
     that exists: the nights must be inside the host's booking window, free of
@@ -267,10 +294,10 @@ def quote_nights(booking: Booking, check_in: date, check_out: date, now=None) ->
     availability.split_stay). The villa is genuinely free either side of it, so
     the stay extends around it and only the nights actually slept are charged.
 
-    One rule is this screen's own: the range has to JOIN the stay. It may run
-    on from the last night, back from the first, or fill a gap in the middle,
-    but it has to touch what is already held — a detached range would be a
-    second stay hiding inside the first, and the guest should book that, not
+    One rule is this screen's own: what is asked for has to JOIN the stay. It
+    may run on from the last night, back from the first, or fill a gap in the
+    middle, but it has to touch what is already held — a detached range would be
+    a second stay hiding inside the first, and the guest should book that, not
     bolt it on.
 
     Nothing is charged for nights the guest already holds, so dragging across
@@ -284,22 +311,37 @@ def quote_nights(booking: Booking, check_in: date, check_out: date, now=None) ->
         quote.error = blocked
         return quote
 
-    if not check_in or not check_out or check_out <= check_in:
+    villa = booking.villa
+    held = booking.occupied_nights()
+    asked = set(nights or ())
+    if check_in and check_out and check_out > check_in:
+        night = check_in
+        while night < check_out:
+            asked.add(night)
+            night += timedelta(days=1)
+    asked = sorted(asked)
+    if not asked:
         quote.error = "Choose the dates you'd like to add."
         return quote
 
-    villa = booking.villa
-    held = booking.occupied_nights()
-    asked, night = [], check_in
-    while night < check_out:
-        asked.append(night)
-        night += timedelta(days=1)
-
-    # The range has to touch the stay: run on from its last night, back from
-    # its first, or fill a gap in the middle. Checked on the RANGE rather than
-    # on the runs it would produce, because a night somebody else holds inside
-    # it is skipped below and would otherwise look like a detached second stay.
-    if held and (check_in > max(held) + timedelta(days=1) or check_out < min(held)):
+    # What was asked for has to touch the stay: run on from its last night, back
+    # from its first, or fill a gap in the middle. Checked on the OUTER BOUNDS of
+    # the request rather than on the runs it would produce, because a night
+    # somebody else holds inside it is skipped below and would otherwise look
+    # like a detached second stay.
+    #
+    # A night this booking GAVE BACK counts as part of the stay for this test,
+    # because it was: taking it back re-joins it. Without that, a guest who
+    # dropped the first three nights of their stay could not reclaim the first of
+    # them — it would measure as detached from the two that remain, when in fact
+    # it is the same booking's own night being picked up again.
+    given_back = set(booking.cancelled_nights())
+    anchor = held | {n for n in asked if n in given_back}
+    span_start = asked[0]
+    span_end = asked[-1] + timedelta(days=1)
+    if anchor and (
+        span_start > max(anchor) + timedelta(days=1) or span_end < min(anchor)
+    ):
         quote.error = (
             "Added nights have to carry on from your stay. Please choose dates "
             "next to the nights you already have."
@@ -464,7 +506,7 @@ class ChangesQuote:
 
 def quote_changes(
     booking: Booking, names=(), check_in: Optional[date] = None,
-    check_out: Optional[date] = None, now=None,
+    check_out: Optional[date] = None, nights=(), now=None,
 ) -> ChangesQuote:
     """
     Price everything the guest is adding, in one answer.
@@ -479,7 +521,7 @@ def quote_changes(
     """
     now = now or timezone.now()
     combo = ChangesQuote()
-    wants_nights = bool(check_in and check_out)
+    wants_nights = bool((check_in and check_out) or nights)
     wants_services = bool([n for n in (names or []) if str(n or "").strip()])
 
     if not wants_nights and not wants_services:
@@ -488,7 +530,7 @@ def quote_changes(
 
     added_nights = []
     if wants_nights:
-        combo.nights = quote_nights(booking, check_in, check_out, now)
+        combo.nights = quote_nights(booking, check_in, check_out, nights, now)
         if not combo.nights.allowed:
             combo.error = combo.nights.error
             return combo

@@ -528,6 +528,13 @@ class BookingEditOptionsType:
     max_check_out: str
     unavailable_dates: List[str]
     own_nights: List[str]
+    # Nights this booking gave back and has not taken again. They are free like
+    # any other free date — that is what giving them back DID — but the guest
+    # who gave them up should read them as theirs to reclaim rather than as
+    # strangers' dates, and they sit inside the stay's own span where a range
+    # cannot name one without naming its neighbours. So the picker marks them
+    # and takes them one at a time (see additions.quote_nights' `nights`).
+    cancelled_nights: List[str]
     check_in_time: str
     server_now: str
 
@@ -566,6 +573,7 @@ class BookingEditOptionsType:
                 )
             ],
             own_nights=[d.isoformat() for d in sorted(booking.occupied_nights())],
+            cancelled_nights=[d.isoformat() for d in booking.cancelled_nights()],
             check_in_time=_hhmm(availability.check_in_cutoff(villa)),
             server_now=timezone.localtime(now).strftime("%Y-%m-%dT%H:%M"),
         )
@@ -1266,8 +1274,10 @@ class BookingType:
         # nights ahead of it — see properties/additions.blocked_reason, which is
         # what the mutations enforce and this only mirrors.
         addition_rows = list(booking.additions.all())
+        from properties import additions as addons
+
         unstarted = booking.unstarted_nights(now)
-        can_add = not cancelled and not booking.stay_over(now)
+        can_add = not cancelled and not addons.blocked_reason(booking, now)
 
         # The live check-in PIN, if there is one. Which of its fields are filled
         # in depends entirely on who is asking: the digits go to the guest and
@@ -1286,9 +1296,13 @@ class BookingType:
             if gate.otp_required
             else None
         )
+        # Past the booked hour a departure takes no code at all, so the guest is
+        # shown none — a PIN issued in the last minute before that hour would
+        # otherwise sit on their booking page for another minute, asking to be
+        # read out for a step the host no longer has to take.
         out_pin_row = (
             CheckInVerification.live_for(booking, now, purpose=CheckInVerification.PURPOSE_CHECK_OUT)
-            if out_gate.available
+            if out_gate.available and booking.check_out_pin_required(now)
             else None
         )
         # The guest's review of this stay, if any (reverse one-to-one).
