@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from math import ceil
 
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -42,6 +42,26 @@ FORCED_CHECK_OUT_MINUTES = 30
 # about the listing, the other is a fact about something the reader DID.
 MSG_VILLA_REMOVED_GUEST = "This property is no longer listed on MyVilla."
 MSG_VILLA_REMOVED_OWNER = "You removed this property from MyVilla."
+
+
+# What each side is told when a guest never turned up. The arrival window
+# closing cancels the whole booking on its own (see `Booking.sync_no_show`) —
+# there is no decision left for anybody to make about it, so both readers are
+# told what has already happened rather than offered something to do.
+#
+# Worded from where each of them stands: the host's sentence is about their
+# property and their calendar, the guest's is about their money. Neither is
+# shown the other's — a host does not need to be told what the guest was
+# refunded, and a guest reading "your nights are back on the calendar" would
+# think the sentence was meant for somebody else.
+MSG_NO_SHOW_OWNER = (
+    "The guest never checked in, so this booking was cancelled automatically "
+    "when the arrival window closed. Nothing is refunded to them."
+)
+MSG_NO_SHOW_GUEST = (
+    "You did not check in before the arrival window closed, so this booking "
+    "was cancelled. A missed arrival is not refundable, so nothing comes back."
+)
 
 
 class VillaQuerySet(models.QuerySet):
@@ -508,10 +528,12 @@ class Booking(models.Model):
     # answer to "who ended it?", which is the question anyone reviewing a
     # disputed departure months later is actually asking.
     forced_check_out_at = models.DateTimeField(null=True, blank=True)
-    # The host's decision to take a no-show guest in anyway. Re-opens check-in
-    # (with the same PIN verification) after the window has closed; the refund
-    # stays 0% either way — the guest missed the window they agreed to.
-    late_check_in_allowed = models.BooleanField(default=False)
+    # There was a `late_check_in_allowed` here: the host's decision to take a
+    # no-show guest in after the window had closed. It has gone, along with the
+    # button that set it. A window that can be re-opened by whoever is standing
+    # at the desk is not a window, and while it stayed open the villa stayed off
+    # the market for a guest who was not coming. The window now closes once and
+    # closes the booking with it (see `sync_no_show`).
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -541,15 +563,21 @@ class Booking(models.Model):
     #
     #   15 days or more before check-in → 100% back, free
     #   7–15 days                       →  90% back, 10% charge
-    #   3–7 days                        →  75% back, 25% charge
-    #   24 hours–3 days                 →  50% back, 50% charge
+    #   3–7 days                        →  50% back, 50% charge
+    #   24 hours–3 days                 →  10% back, 90% charge
     #   inside the last 24 hours        →   0% back — still cancellable, but the
     #                                       stay is non-refundable
     #   at/after the check-in time      → cancelling is closed, 0% back
     #
     # Every boundary is a moment, never a date: for a 2 PM check-in, 1:59 PM the
     # day before is already inside the last 24 hours, and 2:01 PM three days out
-    # has just crossed into the 50% band.
+    # has just crossed into the 50% band. A boundary landed on exactly gives the
+    # guest the kinder side of it — 7 days out is the 90% band, not the 50%.
+    #
+    # And the moment measured to is the moment of the NIGHT being given up, not
+    # the start of the stay (see `night_refund_tiers`). A guest handing back the
+    # last night of a fortnight's stay has given a fortnight's notice on it,
+    # whatever the notice on their arrival happens to be.
     NO_REFUND_WINDOW_HOURS = 24
     REFUND_AFTER_CHECK_IN = 0
 
@@ -567,8 +595,8 @@ class Booking(models.Model):
     REFUND_TIERS = (
         (15 * 24, 100, MSG_FREE),
         (7 * 24, 90, "Cancelling now carries a 10% charge — 90% is refunded."),
-        (3 * 24, 75, "Cancelling now carries a 25% charge — 75% is refunded."),
-        (NO_REFUND_WINDOW_HOURS, 50, "Cancelling now carries a 50% charge — half is refunded."),
+        (3 * 24, 50, "Cancelling now carries a 50% charge — half is refunded."),
+        (NO_REFUND_WINDOW_HOURS, 10, "Cancelling now carries a 90% charge — 10% is refunded."),
         (0, 0, MSG_NO_REFUND),
     )
     MSG_EXPIRED = "Cancellation period has expired."
@@ -931,26 +959,88 @@ class Booking(models.Model):
             return self.LIFECYCLE_AWAITING
         return self.LIFECYCLE_NO_SHOW
 
+    def no_show_message(self, *, for_owner: bool) -> str:
+        """The line to show about a stay nobody arrived for, from the reader's
+        own side — "" on a booking that isn't one."""
+        if self.no_show_at is None:
+            return ""
+        return MSG_NO_SHOW_OWNER if for_owner else MSG_NO_SHOW_GUEST
+
+    def no_show_cancellation(self) -> "NightsCancellationQuote":
+        """
+        The receipt for a stay the guest never came to: every night still held,
+        given up, nothing back.
+
+        Built here rather than through `nights_cancellation_quote` because that
+        one prices a DECISION — it asks how far ahead of check-in we are and
+        pays the ladder accordingly, and refuses nights that have already begun.
+        A no-show is neither. The window has shut, the first night has started
+        and is spent, and the ladder's whole subject — how much notice the host
+        got — is answered by "none at all". So the figure is not negotiated: the
+        nights are worth what is left of the booking, and all of it is kept.
+
+        Extra services go with them and are not refunded either, for the same
+        reason the nights aren't: the host stood ready to deliver them.
+        """
+        held = sorted(self.occupied_nights())
+        value = self.nights_value(held, empties=True)
+        return NightsCancellationQuote(
+            nights=tuple(held),
+            stay_value=value,
+            penalty_amount=value,
+            refund_amount=Decimal("0.00"),
+            refund_percentage=0,
+            full=True,
+            allowed=True,
+            # The receipt is the money's own record, and the money is the
+            # guest's side of this — so it carries the guest's wording.
+            message=MSG_NO_SHOW_GUEST,
+            extras_value=Decimal("0.00"),
+        )
+
     def sync_no_show(self, now=None) -> bool:
         """
-        Record the moment this booking became a no-show, if it just has.
+        Close a booking whose arrival window shut with nobody in it.
 
         The no-show STATE is derived — `lifecycle_status` reads it off the clock
-        whether or not anything wrote it down — so this exists purely to keep
-        the timestamp, and it is written lazily, the first time the booking is
-        looked at after the window shut. That avoids a scheduler for something
-        no one is waiting on: nothing about the guest's or host's experience
-        depends on a row being touched at 4:00:00 PM exactly.
+        whether or not anything wrote it down — but what FOLLOWS from it is not
+        derivable, so it is carried out here: the moment is stamped, the whole
+        booking is cancelled, and no refund is issued. A guest who never came
+        does not keep the villa off the market for the rest of the week, and the
+        host is not left holding a stay that can only ever end one way while a
+        button asks them to decide about it.
 
-        Returns True when it stamped (so callers can log it once).
+        Every night goes at once, the booking's outer dates included. The nights
+        already behind us were never going to be sold again anyway — the villa's
+        booking window has moved past today's check-in hour by the time this can
+        run (see availability.first_bookable_date), which is exactly the hour
+        that made this a no-show. So what actually returns to the calendar is
+        every night still ahead, and only those.
+
+        Written lazily, the first time the booking is looked at after the window
+        shut — that avoids a scheduler for something nobody is waiting on at the
+        stroke of the hour. `availability.booked_nights` looks too, so the dates
+        re-open for other guests without anyone opening the booking itself.
+
+        Returns True when it closed something (so callers can log it once).
         """
         now = now or timezone.now()
-        if self.no_show_at is not None:
+        if self.status != self.STATUS_ACTIVE:
+            return False
+        # Somebody DID arrive, for some part of this stay. Whatever the current
+        # part reports, this is not a booking nobody turned up for, and taking
+        # away a stay that was lived in is not this method's business.
+        if self.any_part_arrived:
             return False
         if self.lifecycle_status(now) != self.LIFECYCLE_NO_SHOW:
             return False
-        self.no_show_at = self.current_part_grace_ends_at()
-        self.save(update_fields=["no_show_at", "updated_at"])
+        with transaction.atomic():
+            if self.no_show_at is None:
+                # The moment it BECAME true, not the moment somebody looked —
+                # a booking first opened three days late did not no-show today.
+                self.no_show_at = self.current_part_grace_ends_at()
+                self.save(update_fields=["no_show_at", "updated_at"])
+            self.apply_nights_cancellation(self.no_show_cancellation(), now)
         return True
 
     def check_in_gate(self, now=None) -> "CheckInGate":
@@ -1032,21 +1122,18 @@ class Booking(models.Model):
                 ),
             )
 
-        # A part nobody arrived for whose check-out hour has passed is already
-        # behind us — `current_part` has moved on to the next one, and the whole
-        # stay running out that way is answered by the `stay_over` branch above.
-        # So whatever we are looking at here is still running.
-        #
-        # Past the window, but the stay is still running. The host may take the
-        # guest in by hand — a deliberate decision now, not the normal flow.
-        if self.late_check_in_allowed:
-            return gate(
-                "No Show", visible=True, state="green", available=True, otp=True,
-                message="Late check-in allowed — verify the guest's PIN to check them in.",
-            )
+        # Past the window with nobody in. There is no button here and no
+        # decision to offer: `sync_no_show` has cancelled the booking outright
+        # by the time anybody reads this, and a host cannot take in a guest on a
+        # stay that no longer exists. This branch is what a caller sees in the
+        # instant between the window shutting and the booking being read — the
+        # answer it gives is the same one it will give afterwards.
         return gate(
             "No Show", visible=False, state="hidden", available=False,
-            message="The guest did not check in within the allowed check-in window.",
+            message=(
+                "The guest did not check in before the arrival window closed. "
+                "This booking has been cancelled."
+            ),
         )
 
     # --- Leaving early ---
@@ -1466,16 +1553,18 @@ class Booking(models.Model):
         The parts of this stay that still hold nights the guest may give up,
         each with those nights and the tier they'd come back at.
 
-        Two kinds of part appear here. One nobody has arrived for is refunded on
-        the sliding scale judged at its arrival, exactly as a whole cancellation
-        would be. One already under way — the guest is in, or its check-in hour
-        has been and gone — keeps its money: the nights that haven't started can
-        still be handed back, but at 0%, which is the same bargain leaving early
-        strikes. A part with nothing left to give up is not listed at all.
+        Two kinds of part appear here, and the difference is `begun`. One
+        already under way — the guest is in, or its check-in hour has been and
+        gone — keeps its money: the nights that haven't started can still be
+        handed back, but at 0%, which is the same bargain leaving early strikes.
+        One nobody has arrived for is still on the ladder, and there the tier
+        below is only the part's HEADLINE, judged at its arrival: what each of
+        its nights actually comes back at is judged on that night's own notice
+        (see `night_refund_tiers`, which is what the picker and the quote read).
+        A part with nothing left to give up is not listed at all.
 
         Each entry is the `stay_segment_windows` tuple plus its 1-based index,
-        the nights still open, and the tier — so a caller can price a night the
-        moment it knows which part holds it.
+        the nights still open, whether it has begun, and that headline tier.
         """
         now = now or timezone.now()
         stays = self.part_stays()
@@ -1541,6 +1630,46 @@ class Booking(models.Model):
                 }
             )
         return out
+
+    def night_refund_tiers(self, now=None) -> dict:
+        """
+        Every night the guest may still give up, mapped to the tier THAT NIGHT
+        comes back at: `{night: (refund_percentage, message)}`.
+
+        The one place the per-night ladder is applied, and the authority for
+        every figure the guest is shown: the chips on the picker, the quote
+        underneath them and the cancellation itself all read this, so a night
+        labelled "90% back" is refunded at 90% when it actually goes.
+
+        Each night is judged on ITS OWN notice — the distance from now to the
+        hour that night begins — not on the stay's arrival. A fortnight's stay
+        starting on Friday is a fortnight of different deadlines, and pricing
+        the last night off the first would charge a guest for lateness they were
+        nowhere near: the night they are handing back is three weeks away.
+
+        The exception is a part already under way, where the ladder does not
+        apply at all. Once the guest is in — or their arrival hour has been and
+        gone — the money for the rest of that part is spent, and the nights left
+        can still be handed back but at 0%. That is the same bargain leaving
+        early strikes, and it is decided per PART, because it is a fact about an
+        arrival rather than about a night.
+        """
+        now = now or timezone.now()
+        tiers = {}
+        for part in self.cancellable_parts(now):
+            for night in part["nights"]:
+                if part["begun"]:
+                    tiers[night] = (part["refund_percentage"], part["message"])
+                    continue
+                percentage, message = self.refund_tier_at(
+                    self.night_starts_at(night), now
+                )
+                # Unreachable: a night listed here has not begun, so its moment
+                # is still ahead and the ladder always settles on a band.
+                if percentage is None:
+                    percentage, message = self.REFUND_AFTER_CHECK_IN, self.MSG_NO_REFUND
+                tiers[night] = (percentage, message)
+        return tiers
 
     def cancellable_nights(self, now=None) -> list:
         """Every night the guest could still choose to give up, in date order.
@@ -1672,11 +1801,7 @@ class Booking(models.Model):
         # under way — and a night that has started is the guest's and is shut.
         # So a stay in its second of three nights offers the third, at no refund,
         # instead of vanishing from the picker along with the night being slept.
-        open_nights = {
-            night: part
-            for part in self.cancellable_parts(now)
-            for night in part["nights"]
-        }
+        open_nights = self.night_refund_tiers(now)
         stays = self.part_stays()
         for index, (start, end, _opens_at, _ends_at) in enumerate(
             self.stay_segment_windows(), start=1
@@ -1690,11 +1815,10 @@ class Booking(models.Model):
                 if night in settled:
                     night += timedelta(days=1)
                     continue
-                part = open_nights.get(night)
-                if part is not None:
+                tier = open_nights.get(night)
+                if tier is not None:
                     state = self.NIGHT_OPEN
-                    percentage = part["refund_percentage"]
-                    message = part["message"]
+                    percentage, message = tier
                 elif arrived:
                     state, percentage, message = (
                         self.NIGHT_STARTED, 0, self.MSG_NIGHT_STARTED,
@@ -1754,11 +1878,11 @@ class Booking(models.Model):
         time and need not sit together: handing back one out of the middle
         simply breaks that part into the two runs either side of it, the same
         shape a stay booked around another guest's nights already has.
-        Otherwise every chosen night is
-        priced at its share of the total and refunded at ITS OWN part's tier —
-        a split stay can perfectly well be free to trim at the far end while
-        the part starting tonight is already non-refundable, and this adds the
-        two up rather than pretending one rule covers both.
+        Otherwise every chosen night is priced at its share of the total and
+        refunded at ITS OWN tier — the ladder judged on the distance to that
+        night, not to the stay's arrival (see `night_refund_tiers`). A fortnight
+        booked from Friday is a fortnight of different deadlines, and this adds
+        them up rather than pretending one rule covers all of them.
         """
         now = now or timezone.now()
         chosen = sorted({n for n in nights})
@@ -1785,19 +1909,13 @@ class Booking(models.Model):
         if not set(chosen) <= held:
             return refuse(self.MSG_NOT_BOOKED)
 
-        # Which part each chosen night sits in — and, first, whether that night
-        # is still the guest's to give back. A night that has begun is spent,
+        # What each chosen night comes back at — and, first, whether it is still
+        # the guest's to give back at all. A night that has begun is spent,
         # whichever part it belongs to; the rest of that part is not.
-        parts = {p["index"]: p for p in self.cancellable_parts(now)}
-        open_nights = {
-            night: part["index"] for part in parts.values() for night in part["nights"]
-        }
-        by_part = {}
+        tiers = self.night_refund_tiers(now)
         for night in chosen:
-            index = open_nights.get(night)
-            if index is None:
+            if night not in tiers:
                 return refuse(self.MSG_NIGHT_STARTED)
-            by_part.setdefault(index, []).append(night)
 
         # A night out of the middle is allowed, and needs nothing said here:
         # `drop_nights` rewrites the part as the two runs either side of it, and
@@ -1814,27 +1932,32 @@ class Booking(models.Model):
         extras_value = min(self.extras_for_nights(chosen), stay_value)
         accommodation = stay_value - extras_value
 
-        # Priced per part, then added up: each part's nights carry that part's
-        # own tier. The parts' values are shares of the same pro-rata split, so
-        # the last one takes the remainder and the pieces still sum to
-        # `accommodation` to the rupee.
+        # Priced NIGHT BY NIGHT, then added up: each night carries its own tier,
+        # because each was given its own notice (see `night_refund_tiers`). The
+        # accommodation is flat per night — the rate, fee, tax and discount all
+        # belong to the whole stay — so every night takes an equal share of it,
+        # and the last takes the remainder, which is what keeps the pieces
+        # summing to `accommodation` to the rupee.
         refund = extras_value
         spent = Decimal("0.00")
-        messages = []
-        for position, (index, part_nights) in enumerate(sorted(by_part.items()), start=1):
-            if position == len(by_part):
+        count = len(chosen)
+        # How many nights came back at each percentage, in the order the ladder
+        # gives them — what the summary line is written from below.
+        bands = {}
+        for position, night in enumerate(chosen, start=1):
+            if position == count:
                 value = accommodation - spent
             else:
-                value = (
-                    accommodation * Decimal(len(part_nights)) / Decimal(len(chosen))
-                ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                value = (accommodation / Decimal(count)).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
             spent += value
-            percentage = parts[index]["refund_percentage"]
+            percentage, message = tiers[night]
             refund += (value * Decimal(percentage) / Decimal(100)).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
-            if parts[index]["message"] not in messages:
-                messages.append(parts[index]["message"])
+            band = bands.setdefault(percentage, {"nights": 0, "message": message})
+            band["nights"] += 1
 
         refund = max(Decimal("0.00"), min(refund, stay_value))
         percentage = (
@@ -1850,8 +1973,33 @@ class Booking(models.Model):
             refund_percentage=percentage,
             full=empties,
             allowed=True,
-            message=" ".join(messages) or self.MSG_FREE,
+            message=self._refund_summary(bands),
             extras_value=extras_value,
+        )
+
+    @staticmethod
+    def _refund_summary(bands: dict) -> str:
+        """The sentence under a selection priced across more than one tier.
+
+        One band speaks for itself — it is the ladder's own line, the same one
+        the night's chip carries. Several cannot: stacking three tier sentences
+        would read as three contradictory rules rather than as one selection
+        with different notice on each night. So they are counted instead, in
+        ladder order, and the guest is told what they can check against the
+        chips they just tapped."""
+        if not bands:
+            return Booking.MSG_FREE
+        if len(bands) == 1:
+            return next(iter(bands.values()))["message"]
+        parts = [
+            f"{percentage}% on {band['nights']} night"
+            f"{'' if band['nights'] == 1 else 's'}"
+            for percentage, band in sorted(bands.items(), reverse=True)
+        ]
+        return (
+            "Each night is refunded on its own notice: "
+            + ", ".join(parts[:-1])
+            + f" and {parts[-1]}."
         )
 
     def drop_nights(self, nights, now=None) -> None:

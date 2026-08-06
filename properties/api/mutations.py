@@ -1220,36 +1220,13 @@ class PropertyMutation:
             raise GraphQLError(str(exc))
         return BookingType.from_model(booking, request=info.context.request)
 
-    @strawberry.mutation
-    def allow_late_check_in(
-        self, info: strawberry.Info, id: strawberry.ID
-    ) -> BookingType:
-        """
-        Re-open check-in on a no-show, at the host's discretion.
-
-        The guest missed the window, so the booking stays a no-show on the
-        record and the refund stays 0%; this only puts the (still PIN-verified)
-        check-in button back, for the host who decides to take them in anyway.
-        """
-        booking = _owned_booking(info, id)
-        # Per PART, not per booking: a split stay is arrived at more than once,
-        # and each arrival needs its own PIN.
-        if booking.current_part_checked_in_at() is not None:
-            raise GraphQLError("This guest is already checked in.")
-        now = timezone.now()
-        if booking.lifecycle_status(now) != Booking.LIFECYCLE_NO_SHOW:
-            raise GraphQLError(
-                "This booking isn't a no-show — check-in is still open normally."
-            )
-        # The stay itself has run out: there is no longer anything to check the
-        # guest into, so this isn't a decision the host still gets to make.
-        if now >= booking.check_out_datetime():
-            raise GraphQLError(
-                "This stay has ended — the guest never checked in, and check-in "
-                "can't be reopened after the check-out time."
-            )
-        checkin.allow_late_check_in(booking, actor=require_authenticated_user(info), now=now)
-        return BookingType.from_model(booking, request=info.context.request)
+    # There was an `allow_late_check_in` mutation here, and a button for it on
+    # the host's dashboard. Both have gone. A no-show now ends the booking as
+    # the window closes (see Booking.sync_no_show), so by the time a host could
+    # reach for that button there is no live stay to take the guest into — and
+    # while it existed, the villa sat off the market waiting on a decision about
+    # a guest who was not coming. A host who wants to let somebody stay after
+    # all can take the booking again; the nights are back on their calendar.
 
     # --- Check-out, in the same two steps ---
     #

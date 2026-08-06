@@ -122,6 +122,51 @@ def window_end(villa, now=None) -> date:
     return last_bookable_date(villa, now) + timedelta(days=1)
 
 
+def release_no_shows(villa_ids: Iterable[int], start: date, end: date, now=None) -> int:
+    """
+    Cancel the bookings in this window that nobody turned up for, and hand their
+    nights back. Returns how many were closed.
+
+    The platform runs no scheduler (see `Booking.sync_no_show`), so a no-show is
+    written down the first time anything looks at the booking. Reading the
+    CALENDAR has to count as looking, or the one consequence that matters to
+    somebody other than the two people on the booking — the villa going back on
+    sale — would wait on one of those two people opening a page.
+
+    Kept cheap on purpose. Only bookings whose arrival hour is already behind us
+    are candidates, and only those still unstamped and unarrived-for; on the
+    ordinary calendar read that is an empty queryset and this costs one index
+    lookup. `sync_no_show` re-checks every rule itself, so a candidate that
+    turns out not to be a no-show is simply passed over.
+    """
+    now = now or timezone.now()
+    ids = [int(i) for i in villa_ids]
+    if not ids:
+        return 0
+    candidates = (
+        Booking.objects.filter(
+            villa_id__in=ids,
+            status=Booking.STATUS_ACTIVE,
+            check_in__lt=end,
+            check_out__gt=start,
+            # Its first night has begun — nothing earlier can have missed a
+            # window that hasn't opened. `today_local` and not `now.date()`:
+            # every date rule here is judged on the app's own clock.
+            check_in__lte=today_local(now),
+            # Nobody was ever checked in. A split stay whose later part is
+            # missed is not a stay nobody came to, and `sync_no_show` refuses
+            # it too — this only saves the trip.
+            checked_in_at__isnull=True,
+        )
+        .select_related("villa")
+    )
+    closed = 0
+    for booking in candidates:
+        if booking.sync_no_show(now):
+            closed += 1
+    return closed
+
+
 def booked_nights(
     villa_ids: Iterable[int], start: date, end: date, exclude_booking_id=None
 ) -> Dict[int, set]:
@@ -140,6 +185,11 @@ def booked_nights(
     ids = [int(i) for i in villa_ids]
     if not ids:
         return {}
+    # A booking nobody ever arrived for is closed here, before it is counted.
+    # Otherwise it would go on holding the villa off the market until somebody
+    # happened to OPEN it, and the guest who wanted those dates is exactly the
+    # person who never would (see `release_no_shows`).
+    release_no_shows(ids, start, end)
     rows = Booking.objects.filter(
         villa_id__in=ids,
         status=Booking.STATUS_ACTIVE,

@@ -1289,10 +1289,14 @@ class BookingType:
     # When the window opens and when it shuts — naive wall-clock, like
     # check_in_at, so they compare to server_now directly.
     grace_ends_at: str
-    # Stamped when the window closed with nobody checked in ("" until then),
-    # and whether the host has since chosen to take the guest in anyway.
+    # Stamped when the window closed with nobody checked in ("" until then).
+    # That moment also cancels the booking outright, so this is what tells the
+    # two states apart: a stay cancelled with a no_show_at was not called off by
+    # anybody, it simply ran out of guest.
     no_show_at: str
-    late_check_in_allowed: bool
+    # What to SAY about it, worded for whoever is reading — the host is told
+    # about their calendar, the guest about their money. "" when it isn't one.
+    no_show_message: str
 
     # --- Check-out window (see Booking.check_out_gate) ---
     # There is no hour to miss on the way out, so this is only "may the host
@@ -1370,12 +1374,14 @@ class BookingType:
         # other by the odd millisecond.
         now = timezone.now()
         policy = booking.cancellation_policy(now)
-        # Reading a booking is also when a no-show gets written down: nothing
-        # is waiting on the stroke of the hour, so there's no scheduler — the
-        # first look after the window shut records the moment (see sync_no_show).
+        # Reading a booking is also when a no-show is acted on: nothing is
+        # waiting on the stroke of the hour, so there's no scheduler — the first
+        # look after the window shut stamps the moment AND cancels the stay for
+        # nothing back (see sync_no_show). The calendar does the same looking,
+        # so this is not the only door it can happen behind.
         if booking.sync_no_show(now):
             checkin_logger.info(
-                "checkin event=no_show_recorded booking=%s villa=%s guest=%s at=%s",
+                "checkin event=no_show_cancelled booking=%s villa=%s guest=%s at=%s",
                 booking.pk, booking.villa_id, booking.guest_id,
                 booking.no_show_at.isoformat(),
             )
@@ -1608,7 +1614,12 @@ class BookingType:
             checkin_message=gate.message,
             grace_ends_at=gate.grace_ends_at.replace(tzinfo=None).isoformat(),
             no_show_at=booking.no_show_at.isoformat() if booking.no_show_at else "",
-            late_check_in_allowed=booking.late_check_in_allowed,
+            # Read the same way `villa_removed_message` is: off the JWT's
+            # viewer, so the host reads the host's sentence and everyone else
+            # reads the guest's.
+            no_show_message=booking.no_show_message(
+                for_owner=viewer is not None and viewer.pk == villa.owner_id
+            ),
             checkout_available=out_gate.available,
             checkout_message=out_gate.message,
             checkout_early_now=out_gate.early,

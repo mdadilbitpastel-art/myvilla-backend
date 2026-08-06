@@ -264,7 +264,6 @@ def verify_pin(
         actor=actor,
         purpose=purpose,
         verification=verification.pk,
-        late=booking.late_check_in_allowed or None,
         released_nights=released or None,
         guests=arriving,
     )
@@ -421,21 +420,11 @@ def sync_forced_check_out(booking, *, now=None) -> bool:
     return True
 
 
-def allow_late_check_in(booking, *, actor=None, now=None) -> None:
-    """
-    The host's decision to take a guest in after the window shut.
-
-    Re-opens check-in — through the same PIN verification, so a late arrival is
-    still proved rather than asserted. The refund stays 0%: the guest missed the
-    window they agreed to, and the host choosing to be accommodating about the
-    room is not the same as the platform refunding the stay.
-    """
-    now = now or timezone.now()
-    if booking.late_check_in_allowed:
-        return
-    booking.late_check_in_allowed = True
-    booking.save(update_fields=["late_check_in_allowed", "updated_at"])
-    _audit("late_checkin_allowed", booking, actor=actor)
+# There was an `allow_late_check_in` here — the host's decision to take a guest
+# in after the window shut. It has gone with the button and the mutation that
+# called it: the window closing now cancels the booking (Booking.sync_no_show),
+# so there is nothing left to re-open, and the nights go back on sale instead of
+# waiting on a decision.
 
 
 def _send_guest_alert(booking, verification, *, now=None) -> None:
