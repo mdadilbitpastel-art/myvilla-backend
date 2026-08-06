@@ -10,8 +10,18 @@ class VillaImageInline(admin.TabularInline):
 
 @admin.register(Villa)
 class VillaAdmin(admin.ModelAdmin):
-    list_display = ("title", "owner", "city", "country", "price_per_night", "created_at")
-    list_filter = ("country", "property_type", "created_at")
+    """
+    Every villa, listed and removed alike. A removal is a stamped date, not a
+    deleted row (see Villa.soft_delete), so `deleted_at` is a column and a
+    filter here — it is the difference between a property guests can find and
+    one that survives only for the bookings pointing at it.
+    """
+
+    list_display = (
+        "title", "owner", "city", "country", "price_per_night",
+        "created_at", "deleted_at",
+    )
+    list_filter = ("country", "property_type", "created_at", "deleted_at")
     search_fields = ("title", "city", "country", "owner__email")
     inlines = [VillaImageInline]
 

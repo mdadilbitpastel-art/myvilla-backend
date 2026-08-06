@@ -9,7 +9,12 @@ from graphql import GraphQLError
 
 from accounts.auth import get_authenticated_user
 from accounts.security import require_authenticated_user
-from properties import additions as addons, availability, coupons as coupon_utils
+from properties import (
+    additions as addons,
+    availability,
+    coupons as coupon_utils,
+    removals,
+)
 from properties.models import Booking, Coupon, Favorite, Review, Villa, VillaBlockedDate
 from .types import (
     BookedRangeType,
@@ -23,6 +28,7 @@ from .types import (
     OfferType,
     ReviewType,
     SavedPaymentType,
+    ServiceRemovalQuoteType,
     StaySegmentType,
     VillaAvailabilityType,
     VillaType,
@@ -326,6 +332,9 @@ class PropertyQuery:
 
         `nights` are dates picked one at a time — how a guest takes back single
         nights they had given up — and are added to whatever the range covers.
+        They are also the ONLY way a given-back night comes back: the range
+        passes over those, so extending past them never reclaims them by
+        accident.
         """
         return ChangesQuoteType.from_quote(
             addons.quote_changes(
@@ -335,6 +344,29 @@ class PropertyQuery:
                 availability.parse_date(check_out),
                 availability.parse_dates(nights),
                 timezone.now(),
+            )
+        )
+
+    @strawberry.field
+    def booking_service_removal_quote(
+        self,
+        info: strawberry.Info,
+        id: strawberry.ID,
+        services: Optional[List[str]] = None,
+    ) -> ServiceRemovalQuoteType:
+        """
+        What dropping these extra services from one's own booking would hand
+        back — the refund half of the edit screen.
+
+        Its own query and not part of `booking_changes_quote` because it is its
+        own act: money going back to the guest is not netted off money they are
+        about to pay, and a refund needs no payment method to settle it. Priced
+        at the server's clock, on the nights of each service that haven't
+        started, so what the screen shows is what the button gives.
+        """
+        return ServiceRemovalQuoteType.from_quote(
+            removals.quote_removal(
+                _own_booking_for_edit(info, id), services or [], timezone.now()
             )
         )
 
@@ -389,12 +421,15 @@ class PropertyQuery:
         """
         Public: the most recent reviews across ALL villas that carry written
         text — for the landing-page testimonials. Empty-comment ratings are left
-        out (a testimonial card needs something to say).
+        out (a testimonial card needs something to say), and so are reviews of
+        villas their host has taken down: the card names the property, and the
+        home page must not advertise one that can't be booked.
         """
         viewer = get_authenticated_user(info)
         limit = max(1, min(limit, 60))
         reviews = (
-            Review.objects.exclude(comment="")
+            Review.objects.filter(villa__deleted_at__isnull=True)
+            .exclude(comment="")
             .select_related("guest", "villa")
             .order_by("-created_at")[:limit]
         )
@@ -421,7 +456,7 @@ class PropertyQuery:
         """Villas the current user has saved to their wishlist. Requires a session."""
         user = require_authenticated_user(info)
         villas = (
-            Villa.objects.filter(favorited_by__user=user)
+            Villa.objects.live().filter(favorited_by__user=user)
             .select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images")
             .order_by("-favorited_by__created_at")
         )
@@ -430,13 +465,17 @@ class PropertyQuery:
     @strawberry.field
     def my_villas_count(self, info: strawberry.Info) -> int:
         """
-        How many villas the current user owns. Cheap enough to call from the
-        account sidebar on every page: the host-only sections (Rent Requests,
-        Coupons) appear only once this is at least 1, and hide again the moment
-        the last property is removed.
+        How many LISTED villas the current user owns. Cheap enough to call from
+        the account sidebar on every page: the host-only sections (Rent
+        Requests, Coupons) appear once this is at least 1.
+
+        Taking a property down drops it from this count — it is no longer a
+        listing — which is why the sidebar does not gate on this alone: a host
+        whose last villa is removed still has the stays booked on it to see
+        through, so `my_villa_bookings_count` keeps Rent Requests open.
         """
         user = require_authenticated_user(info)
-        return Villa.objects.filter(owner=user).count()
+        return Villa.objects.live().filter(owner=user).count()
 
     @strawberry.field
     def my_bookings_count(self, info: strawberry.Info) -> int:
@@ -507,13 +546,17 @@ class PropertyQuery:
             else:
                 if coupon.owner_id not in rep_cache:
                     rep_cache[coupon.owner_id] = (
-                        Villa.objects.filter(owner_id=coupon.owner_id)
+                        Villa.objects.live().filter(owner_id=coupon.owner_id)
                         .select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images")
                         .order_by("-created_at")
                         .first()
                     )
                 villa = rep_cache[coupon.owner_id]
-            if villa is None or villa.id in seen_villas:
+            # A villa-scoped coupon whose villa has since been taken down still
+            # exists as a row; it must not put a property nobody can book on the
+            # front page. (`delete_villa` switches those coupons off, so this is
+            # the belt to that braces — rows written before it, or by hand.)
+            if villa is None or villa.is_deleted or villa.id in seen_villas:
                 continue
             seen_villas.add(villa.id)
             offers.append(OfferType.from_pair(villa, coupon, request=request))
@@ -534,7 +577,7 @@ class PropertyQuery:
         night count. Returns whether it applies and, if so, the amount off this
         stay's accommodation subtotal (the same figure the booking will freeze).
         """
-        villa = Villa.objects.filter(pk=villa_id).first()
+        villa = Villa.objects.live().filter(pk=villa_id).first()
         if villa is None:
             return CouponPreviewType(
                 valid=False,
@@ -588,7 +631,7 @@ class PropertyQuery:
         """
         user = require_authenticated_user(info)
         villas = (
-            Villa.objects.filter(owner=user)
+            Villa.objects.live().filter(owner=user)
             .select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images")
             .order_by("-created_at")
         )
@@ -610,7 +653,7 @@ class PropertyQuery:
         exactly when they need to know a stay IS booked.
         """
         user = require_authenticated_user(info)
-        villa = Villa.objects.filter(pk=villa_id, owner=user).first()
+        villa = Villa.objects.live().filter(pk=villa_id, owner=user).first()
         if villa is None:
             raise GraphQLError("Villa not found.")
         return build_villa_availability(villa, days)
@@ -639,7 +682,7 @@ class PropertyQuery:
         this names no guests and reveals nothing beyond "you can't have that
         night", which is exactly what the reservation calendar has to know.
         """
-        villa = Villa.objects.filter(pk=villa_id).first()
+        villa = Villa.objects.live().filter(pk=villa_id).first()
         if villa is None:
             raise GraphQLError("Villa not found.")
         return BookingWindowType.from_model(villa)
@@ -672,7 +715,7 @@ class PropertyQuery:
         - `min_price` / `max_price` price-per-night range
         """
         limit = max(1, min(limit, 60))
-        qs = Villa.objects.select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images")
+        qs = Villa.objects.live().select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images")
 
         condition = _search_filter(search)
         if condition is not None:
@@ -713,7 +756,7 @@ class PropertyQuery:
         Public: a single villa by id (used by the detail page). Pass the dates
         and party size to have its availability answered for that exact stay.
         """
-        v = Villa.objects.select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images").filter(pk=id).first()
+        v = Villa.objects.live().select_related("owner").annotate(avg_rating=Avg("reviews__rating"), review_count=Count("reviews", distinct=True)).prefetch_related("images").filter(pk=id).first()
         if v is None:
             return None
         return _with_availability(

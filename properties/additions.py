@@ -15,11 +15,12 @@ Two things can be added:
     stay's own frozen nightly rate with the same fee and tax the checkout
     applied.
 
-Nothing here ever REMOVES anything. Services already bought stay bought, and
-nights are given up through `Booking.nights_cancellation_quote` — with its
-refund ladder — not through this module. Everything is priced on the server's
-clock at the moment it is asked, exactly like a cancellation, so a quote the
-guest reads is the arithmetic the button performs.
+Nothing here ever REMOVES anything: this module only charges. Nights are given
+up through `Booking.nights_cancellation_quote` — with its refund ladder — and a
+service is dropped through `properties/removals.py`, which refunds the nights of
+it that haven't started. Everything is priced on the server's clock at the
+moment it is asked, exactly like a cancellation, so a quote the guest reads is
+the arithmetic the button performs.
 """
 
 from dataclasses import dataclass, field
@@ -48,6 +49,10 @@ MSG_AWAITING_ARRIVAL = (
     "Check-in time has passed, so this stay can't be changed until you've "
     "checked in. Check in first and you can add to it from there."
 )
+MSG_VILLA_REMOVED = (
+    "This property is no longer listed on MyVilla, so nothing more can be "
+    "bought on this stay. The stay itself goes ahead exactly as booked."
+)
 
 
 def _money(value) -> Decimal:
@@ -60,7 +65,7 @@ def _pretty(day: date) -> str:
 
 def blocked_reason(booking: Booking, now=None) -> str:
     """
-    Why this booking can't be added to at all, or "" when it can.
+    Why this booking can't be CHANGED at all, or "" when it can.
 
     Three doors are shut. A cancelled booking is not a stay any more, and a stay
     every part of which is behind us has nothing left to sell.
@@ -82,6 +87,26 @@ def blocked_reason(booking: Booking, now=None) -> str:
     if part["checked_in_at"] is None and now >= part["opens_at"]:
         return MSG_AWAITING_ARRIVAL
     return ""
+
+
+def purchase_blocked_reason(booking: Booking, now=None) -> str:
+    """
+    Why nothing more can be BOUGHT on this booking, or "" when something can.
+
+    Every door `blocked_reason` shuts, plus one of its own: the host has taken
+    the property off MyVilla. That distinction is the whole point of keeping the
+    two apart. A removed listing must not sell anything further — no extra
+    nights, no extra services, on a property nobody can book — but the guest is
+    not thereby locked into what they already hold. Giving a service BACK for a
+    refund goes through `blocked_reason`, and stays open: a refund takes nothing
+    from a host who has walked away from the listing, and refusing it would trap
+    a guest's money on a property that is gone.
+
+    The same reasoning is why cancelling never consults either of these.
+    """
+    if booking.villa.is_deleted:
+        return MSG_VILLA_REMOVED
+    return blocked_reason(booking, now)
 
 
 # --------------------------------------------------------------------------
@@ -132,7 +157,7 @@ def quote_services(booking: Booking, names, now=None, extra_nights=()) -> Servic
     now = now or timezone.now()
     quote = ServiceQuote()
 
-    blocked = blocked_reason(booking, now)
+    blocked = purchase_blocked_reason(booking, now)
     if blocked:
         quote.error = blocked
         return quote
@@ -149,7 +174,7 @@ def quote_services(booking: Booking, names, now=None, extra_nights=()) -> Servic
     if not offered:
         quote.error = (
             "You already have every extra service this villa offers."
-            if booking.service_entries()
+            if booking.live_service_entries()
             else "This villa doesn't offer any extra services."
         )
         return quote
@@ -234,6 +259,11 @@ class NightsQuote:
     # extends around them — the same bargain checkout strikes (see
     # availability.split_stay).
     skipped: List[date] = field(default_factory=list)
+    # Nights inside the range the guest had GIVEN BACK. Left out on purpose: a
+    # range never reclaims them, only a tap on the night itself does. Reported
+    # so the screen can say they were passed over rather than leave the guest to
+    # notice the gap.
+    declined: List[date] = field(default_factory=list)
     accommodation: Decimal = Decimal("0.00")
     service_fee: Decimal = Decimal("0.00")
     tax: Decimal = Decimal("0.00")
@@ -279,10 +309,13 @@ def quote_nights(
     The nights come in two ways, and either or both may be used. `check_in` /
     `check_out` are a RANGE — "extend my stay up to here" — and every free night
     inside it is taken. `nights` is an explicit LIST, which is how a guest picks
-    back single nights they had given up: those sit inside the stay's own span
-    with nights kept either side of them, so a range could not name one without
-    naming its neighbours too. The two are simply unioned before anything below
-    looks at them.
+    back single nights they had given up.
+
+    The two are unioned, with one subtraction: a night this booking gave back is
+    only ever taken when the LIST names it. A range passing over one leaves it
+    where it is. Cancelling a night was a decision, and undoing it has to be one
+    too — the guest who extends past nights they cancelled is saying where their
+    stay now ends, not asking for those nights back by accident.
 
     The rules are the ones the villa already lives by, asked again for a stay
     that exists: the nights must be inside the host's booking window, free of
@@ -306,39 +339,60 @@ def quote_nights(
     now = now or timezone.now()
     quote = NightsQuote()
 
-    blocked = blocked_reason(booking, now)
+    blocked = purchase_blocked_reason(booking, now)
     if blocked:
         quote.error = blocked
         return quote
 
     villa = booking.villa
     held = booking.occupied_nights()
-    asked = set(nights or ())
+    given_back = set(booking.cancelled_nights())
+
+    picked = set(nights or ())
+    ranged = set()
     if check_in and check_out and check_out > check_in:
         night = check_in
         while night < check_out:
-            asked.add(night)
+            ranged.add(night)
             night += timedelta(days=1)
-    asked = sorted(asked)
-    if not asked:
+
+    # A night this booking gave back is NOT swept up by a range reaching across
+    # it. Giving it up was a decision of its own, and taking it back has to be
+    # one too: a guest saying "extend me up to here" past nights they cancelled
+    # is saying where their stay now ENDS, not that they have changed their mind
+    # about the nights in between. So a given-back night inside a range is left
+    # out exactly as a night somebody else holds is — the stay extends around it
+    # — and the only way back in is naming it in `nights`, one at a time.
+    declined = sorted((ranged & given_back) - picked)
+    span = sorted(picked | ranged)
+    asked = sorted((picked | ranged).difference(declined))
+    if not span:
         quote.error = "Choose the dates you'd like to add."
+        return quote
+    if not asked:
+        quote.error = (
+            "Those are nights you gave back. Please tap them one at a time to "
+            "take them again."
+        )
         return quote
 
     # What was asked for has to touch the stay: run on from its last night, back
     # from its first, or fill a gap in the middle. Checked on the OUTER BOUNDS of
     # the request rather than on the runs it would produce, because a night
-    # somebody else holds inside it is skipped below and would otherwise look
-    # like a detached second stay.
+    # somebody else holds — or one given back and left out just above — sits
+    # inside it and would otherwise make the rest look like a detached second
+    # stay.
     #
     # A night this booking GAVE BACK counts as part of the stay for this test,
     # because it was: taking it back re-joins it. Without that, a guest who
     # dropped the first three nights of their stay could not reclaim the first of
     # them — it would measure as detached from the two that remain, when in fact
-    # it is the same booking's own night being picked up again.
-    given_back = set(booking.cancelled_nights())
-    anchor = held | {n for n in asked if n in given_back}
-    span_start = asked[0]
-    span_end = asked[-1] + timedelta(days=1)
+    # it is the same booking's own night being picked up again. Only the ones
+    # actually named count; a given-back night the range merely passed over is
+    # not being taken, so it anchors nothing.
+    anchor = held | (picked & given_back)
+    span_start = span[0]
+    span_end = span[-1] + timedelta(days=1)
     if anchor and (
         span_start > max(anchor) + timedelta(days=1) or span_end < min(anchor)
     ):
@@ -348,6 +402,7 @@ def quote_nights(
         )
         return quote
 
+    quote.declined = declined
     quote.kept = [n for n in asked if n in held]
     wanted = [n for n in asked if n not in held]
     if not wanted:
@@ -405,7 +460,10 @@ def quote_nights(
 
     # The services on the stay carry on over the new nights — they are per
     # night, and the guest is not being asked to give them up to stay longer.
-    for entry in booking.service_entries():
+    # Only the ones the stay still HAS: a service the guest dropped and was
+    # refunded for (see properties/removals.py) must not be sold back to them
+    # by the act of staying two nights longer.
+    for entry in booking.live_service_entries():
         price = _money(entry.get("price", 0) or 0)
         if price <= 0:
             continue
@@ -437,6 +495,14 @@ def quote_nights(
             if quote.skipped
             else ""
         )
+        + (
+            f" {len(quote.declined)} night"
+            f"{' you' if len(quote.declined) == 1 else 's you'} gave back "
+            f"{'was' if len(quote.declined) == 1 else 'were'} left out — tap "
+            "them one at a time to take them again."
+            if quote.declined
+            else ""
+        )
     )
     return quote
 
@@ -453,9 +519,14 @@ def _stage_nights(booking: Booking, quote: NightsQuote) -> list:
     booking.add_nights(quote.nights)
     booking.nights = int(booking.nights or 0) + quote.nights_count
 
-    # Every service on the stay now runs over the new nights too.
+    # Every service the stay still HAS now runs over the new nights too — and
+    # is charged for them (see `quote_nights`). One that was given back is left
+    # exactly as it is: its billed count is what the guest paid, and it covers
+    # nothing in front of them any more.
     entries = booking.service_entries()
     for entry in entries:
+        if booking.service_removed(entry):
+            continue
         entry["nights"] = booking.service_nights(entry) + quote.nights_count
     booking.extra_services = entries
 

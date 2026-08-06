@@ -16,12 +16,14 @@ from properties import (
     availability,
     checkin,
     coupons as coupon_utils,
+    removals,
     welcome,
     whatsapp,
 )
 from properties.images import data_url_to_file
 from properties.models import (
     DEFAULT_GRACE_MINUTES,
+    MSG_VILLA_REMOVED_GUEST,
     Booking,
     Coupon,
     Favorite,
@@ -472,7 +474,7 @@ def _clean_coupon_input(user, data: CouponInput, exclude_id=None):
     coupon must name a villa they own; a common coupon (blank villa) covers them
     all. Codes are unique platform-wide, case-insensitively.
     """
-    if not Villa.objects.filter(owner=user).exists():
+    if not Villa.objects.live().filter(owner=user).exists():
         raise GraphQLError("Add a property before creating a coupon.")
 
     code = coupon_utils.normalise_code(data.code)
@@ -488,7 +490,7 @@ def _clean_coupon_input(user, data: CouponInput, exclude_id=None):
 
     villa = None
     if (data.villa_id or "").strip():
-        villa = Villa.objects.filter(pk=data.villa_id, owner=user).first()
+        villa = Villa.objects.live().filter(pk=data.villa_id, owner=user).first()
         if villa is None:
             raise GraphQLError("Choose one of your own villas, or leave it for all.")
 
@@ -657,20 +659,37 @@ class PropertyMutation:
     @strawberry.mutation
     def delete_villa(self, info: strawberry.Info, id: strawberry.ID) -> bool:
         """
-        Delete a villa the current user owns, along with its photos (files are
-        removed from storage). Returns True on success. Requires a valid session.
+        Take down a villa the current user owns. Returns True on success.
+        Requires a valid session.
+
+        This is a SOFT removal, and deliberately so. Guests may already have
+        paid to stay here, and those stays go on exactly as booked — they are
+        still checked in and out with their PINs, still cancellable on the same
+        ladder, still reviewable afterwards. Erasing the row would take the
+        villa's name, address and photo out from under every one of them.
+
+        So the listing is stamped instead: it leaves search, the home page, the
+        host's own property list and every path that could start a NEW booking
+        (see VillaQuerySet.live), and it survives everywhere a finished or
+        running stay points back at it. The photos are kept for the same reason
+        — a booking that can be looked up has to have something to show.
+
+        Its coupons go with it: a code advertising a property nobody can book
+        is a dead end, so villa-scoped ones are switched off here.
         """
         user = require_authenticated_user(info)
 
         villa = Villa.objects.filter(pk=id, owner=user).first()
         if villa is None:
             raise GraphQLError("Villa not found.")
+        if villa.is_deleted:
+            # Already down. Answer the same as the first press rather than
+            # erroring: the caller asked for a state that already holds.
+            return True
 
         with transaction.atomic():
-            for im in villa.images.all():
-                im.image.delete(save=False)  # drop the stored file (disk/Cloudinary)
-                im.delete()
-            villa.delete()
+            villa.soft_delete()
+            Coupon.objects.filter(villa=villa, active=True).update(active=False)
         return True
 
     @strawberry.mutation
@@ -680,10 +699,15 @@ class PropertyMutation:
         state: True if now saved, False if removed. Requires a valid session.
         """
         user = require_authenticated_user(info)
+        # A removed listing can still be UN-saved — a wishlist holding one the
+        # host has since taken down is exactly the row somebody wants rid of —
+        # but nothing may be saved onto a wishlist any more.
         villa = Villa.objects.filter(pk=villa_id).first()
         if villa is None:
             raise GraphQLError("Villa not found.")
         fav = Favorite.objects.filter(user=user, villa=villa).first()
+        if fav is None and villa.is_deleted:
+            raise GraphQLError(MSG_VILLA_REMOVED_GUEST)
         if fav is not None:
             fav.delete()
             return False
@@ -702,6 +726,14 @@ class PropertyMutation:
         villa = Villa.objects.filter(pk=data.villa_id).first()
         if villa is None:
             raise GraphQLError("Villa not found.")
+        # The listing was taken down — possibly while this guest had the payment
+        # page open. This is the last gate on the way in and the one that has to
+        # hold: every list the villa could have been reached from already drops
+        # it, but a page loaded a minute earlier still carries the id.
+        if villa.is_deleted:
+            raise GraphQLError(
+                f"{MSG_VILLA_REMOVED_GUEST} It can no longer be booked."
+            )
 
         # --- Core rule: you cannot book your own villa ---
         if villa.owner_id == user.id:
@@ -1033,15 +1065,43 @@ class PropertyMutation:
             booking.apply_nights_cancellation(quote, now)
         return BookingType.from_model(booking, request=info.context.request)
 
+    @strawberry.mutation
+    def remove_booking_services(
+        self, info: strawberry.Info, id: strawberry.ID, services: List[str]
+    ) -> BookingType:
+        """
+        Drop extra services from one of the current user's own bookings and
+        refund them.
+
+        The mirror of `add_to_booking`, and the same rule decides it: a night
+        that has begun is spent. Every night of a chosen service that hasn't
+        started comes back IN FULL — the host has not delivered it, so there is
+        nothing for the cancellation ladder to keep a percentage of — and the
+        nights already under way stay bought and stay charged.
+
+        No payment method is asked for and none is needed: this only ever hands
+        money back, to whatever the addition or the booking was paid with.
+        Re-priced HERE, at the server's clock, and never from the quote the
+        screen was showing — a night may have started since it was drawn.
+        """
+        booking = _own_booking(info, id)
+        now = timezone.now()
+        with transaction.atomic():
+            quote = removals.quote_removal(booking, services or [], now)
+            if not quote.allowed:
+                raise GraphQLError(quote.error)
+            removals.apply_removal(booking, quote, now)
+        return BookingType.from_model(booking, request=info.context.request)
+
     # --- Adding to a booking that is already paid for ---
     #
     # The other direction from the two above: a stay can grow as well as shrink.
     # Both mutations are the guest's own, both re-price on the server's clock at
     # the moment the button is pressed rather than trusting the quote the screen
     # was showing, and both charge for what they add — a booking never gains a
-    # service or a night for free. Nothing is ever removed by either: services
-    # already bought stay bought, and nights are given back through the
-    # cancellation path, with its refund ladder.
+    # service or a night for free. Nothing is ever removed by them: nights are
+    # given back through the cancellation path with its refund ladder, and a
+    # service through `remove_booking_services` above.
 
     @strawberry.mutation
     def add_to_booking(
@@ -1074,8 +1134,9 @@ class PropertyMutation:
 
         Nights arrive as a range (`check_in`/`check_out` — "extend up to here")
         and/or as `nights`, an explicit list, which is how a guest takes back
-        single nights they had given up from inside their own span. Both are
-        unioned and charged as one purchase.
+        single nights they had given up. Both are unioned and charged as one
+        purchase — except that a given-back night is only taken when `nights`
+        names it: a range reaching across one passes it by.
         """
         booking = _own_booking(info, id)
         now = timezone.now()

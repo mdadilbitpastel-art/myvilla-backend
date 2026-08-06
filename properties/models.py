@@ -1,7 +1,7 @@
 import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from math import ceil
 
 from django.conf import settings
@@ -35,6 +35,35 @@ GRACE_WARNING_MINUTES = 60
 # half hour is the guest's grace to actually walk out, and after it the stay
 # closes without a code, on the clock alone.
 FORCED_CHECK_OUT_MINUTES = 30
+
+
+# What a guest is told about a property whose host has taken it down, and what
+# the host is told about their own. The two differ on purpose: one is a fact
+# about the listing, the other is a fact about something the reader DID.
+MSG_VILLA_REMOVED_GUEST = "This property is no longer listed on MyVilla."
+MSG_VILLA_REMOVED_OWNER = "You removed this property from MyVilla."
+
+
+class VillaQuerySet(models.QuerySet):
+    """
+    Villas are never really deleted — a host taking one down must not erase the
+    stays booked on it, which go on being checked in and out and are still the
+    receipt for money that changed hands. `delete_villa` stamps `deleted_at`
+    instead, and everything that OFFERS a villa to somebody asks for `.live()`.
+
+    The plain manager still answers with every row on purpose: a booking, a
+    review or a receipt reaches its villa through a foreign key, and those must
+    keep resolving long after the listing is gone.
+    """
+
+    def live(self):
+        """Listings still on the platform — what search, the home page and the
+        booking path may show."""
+        return self.filter(deleted_at__isnull=True)
+
+    def removed(self):
+        """Listings their host has taken down."""
+        return self.filter(deleted_at__isnull=False)
 
 
 @dataclass(frozen=True)
@@ -172,6 +201,15 @@ class Villa(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # When the host took this listing down, or NULL while it is still listed.
+    # A removal is a soft one — see VillaQuerySet — because the bookings already
+    # made on the property must run to their end, and the photo, the title and
+    # the address they were made against have to keep resolving for as long as
+    # anybody can look the stay up.
+    deleted_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    objects = VillaQuerySet.as_manager()
+
     class Meta:
         db_table = "properties_villa"
         ordering = ["-created_at"]
@@ -182,6 +220,33 @@ class Villa(models.Model):
 
     def __str__(self):
         return f"{self.title} ({self.owner_id})"
+
+    @property
+    def is_deleted(self) -> bool:
+        """Whether the host has taken this listing down."""
+        return self.deleted_at is not None
+
+    def soft_delete(self, now=None) -> bool:
+        """
+        Take this listing off the platform without losing it. Returns False if
+        it was already down, so a double-press doesn't move the date.
+
+        Nothing else is touched — not the photos, not the bookings, not the
+        reviews. That is the whole point: a stay on this villa carries on
+        exactly as it was, and only the ways IN to booking a new one close.
+        """
+        if self.deleted_at is not None:
+            return False
+        self.deleted_at = now or timezone.now()
+        self.save(update_fields=["deleted_at", "updated_at"])
+        return True
+
+    def removal_message(self, *, for_owner: bool) -> str:
+        """The line to show about this villa's removal, from the reader's side
+        — "" while it is still listed."""
+        if not self.is_deleted:
+            return ""
+        return MSG_VILLA_REMOVED_OWNER if for_owner else MSG_VILLA_REMOVED_GUEST
 
     @property
     def cover_image_url(self) -> str:
@@ -1290,12 +1355,17 @@ class Booking(models.Model):
 
     def service_covered_nights(self, entry) -> set:
         """
-        Which nights one extra service actually covers.
+        Which nights one extra service actually covers — NOW.
 
         A service ticked at checkout runs the whole stay. One bought later runs
         from the night it was bought (`added_from`) for as many nights as it was
         charged over — and a stay extended afterwards carries it on, which is
         why the count is read live rather than assumed (see `service_nights`).
+
+        A service the guest has since GIVEN BACK covers only the nights it was
+        actually delivered on: the ones it stopped covering are named on the
+        entry (see `service_refunded_night_set`) and taken out here, so
+        cancelling one of them later can't hand its money back a second time.
         """
         nights = self.billed_night_set()
         raw = (entry or {}).get("added_from")
@@ -1305,7 +1375,9 @@ class Booking(models.Model):
                 nights = [n for n in nights if n >= first]
             except ValueError:
                 pass
-        return set(nights[: self.service_nights(entry)])
+        return set(nights[: self.service_nights(entry)]) - self.service_refunded_night_set(
+            entry
+        )
 
     def extras_for_night(self, night) -> Decimal:
         """What the extra services on this booking cost for ONE given night."""
@@ -1966,13 +2038,76 @@ class Booking(models.Model):
             count = 0
         return count if count > 0 else self.billed_nights()
 
+    def service_refunded_night_set(self, entry) -> set:
+        """
+        The nights one service STOPPED covering when the guest gave it back.
+
+        Named one by one rather than counted, because they are not a tidy tail.
+        A stay with a night cancelled out of its middle has a service covering
+        dates either side of a gap, and "the last two" would then mean the wrong
+        two: what the removal gave back is exactly these dates and no others.
+
+        Empty on every service still running (see properties/removals.py).
+        """
+        out = set()
+        for raw in (entry or {}).get("refunded_nights") or []:
+            try:
+                out.add(date.fromisoformat(str(raw)[:10]))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def service_refunded_value(self, entry) -> Decimal:
+        """What was actually handed back off one service when it was dropped.
+
+        Read off the entry rather than multiplied out, because it is NOT simply
+        price × nights-no-longer-covered: a night the guest had already
+        cancelled stops being covered too, but its money came back with the
+        cancellation, not with this."""
+        try:
+            value = Decimal(str((entry or {}).get("refunded_amount") or 0))
+        except (TypeError, ValueError, InvalidOperation):
+            return Decimal("0.00")
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def service_live_nights(self, entry) -> int:
+        """
+        How many nights one service still RUNS for: what it was billed over,
+        less the nights it no longer covers.
+
+        The billed count is left alone by a removal, because `total` and
+        `extras_total` are, exactly as they are by a night cancellation — they
+        are the frozen price of what was bought, and every per-night figure is
+        worked out against them. What the refund changes is what the service
+        still COVERS, and that is this.
+        """
+        return max(0, self.service_nights(entry) - len(self.service_refunded_night_set(entry)))
+
+    def service_removed(self, entry) -> bool:
+        """Whether this service was given back. A service refunded even in part
+        has stopped: only nights that hadn't started could be refunded, so what
+        is left of it is behind the guest, never in front of them."""
+        return bool(self.service_refunded_night_set(entry))
+
     def service_entries(self) -> list:
-        """The booking's extra services as clean dicts, bad rows dropped."""
+        """The booking's extra services as clean dicts, bad rows dropped.
+
+        EVERY one of them, removed ones included — this is what the booking was
+        charged for, and `extras_value` is worked out over it. What the stay
+        still has is `live_service_entries`."""
         return [
             s
             for s in (self.extra_services or [])
             if isinstance(s, dict) and str(s.get("name", "")).strip()
         ]
+
+    def live_service_entries(self) -> list:
+        """The extra services this stay still HAS — the ones not given back.
+
+        What the guest is actually getting, so it is these that a stay extension
+        carries over its new nights, these that are offered back for removal,
+        and only these that stop the same service being bought again."""
+        return [s for s in self.service_entries() if not self.service_removed(s)]
 
     def extras_value(self) -> Decimal:
         """
@@ -1990,8 +2125,14 @@ class Booking(models.Model):
         return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
     def taken_service_names(self) -> set:
-        """The services already on this booking, lower-cased for comparison."""
-        return {str(s.get("name", "")).strip().lower() for s in self.service_entries()}
+        """The services this booking still HAS, lower-cased for comparison.
+
+        A service the guest gave back is not one of them: they were refunded for
+        it and may perfectly well change their mind and buy it again, which is
+        the whole reason removing one is not the end of the story."""
+        return {
+            str(s.get("name", "")).strip().lower() for s in self.live_service_entries()
+        }
 
     def available_extra_services(self) -> list:
         """
@@ -2180,14 +2321,19 @@ class BookingAddition(models.Model):
 
 class BookingCancellation(models.Model):
     """
-    One cancellation event: the whole stay called off, or some of its nights
-    given up.
+    One thing given back off a booking: the whole stay called off, some of its
+    nights given up, or an extra service dropped from the nights it hadn't been
+    delivered on yet.
 
     A booking can be trimmed more than once — two nights this week, another
     three later — so what was cancelled is a LIST of events, not a pair of
     columns. Each row is the frozen receipt for one of them: which nights went,
     what they were worth, what the policy kept and what went back to the guest,
     in the words the guest was shown at the time.
+
+    Services sit here rather than beside the additions because this is the
+    refund ledger — `refunded_total` is the sum of these rows — and money going
+    back to the guest belongs in one place whatever it was for.
 
     The booking's own `cancelled_at` / `cancellation_fee` still describe the
     stay as a whole (the fee is the running total of every event's penalty), so
@@ -2197,9 +2343,11 @@ class BookingCancellation(models.Model):
 
     KIND_FULL = "full"
     KIND_PARTIAL = "partial"
+    KIND_SERVICES = "services"
     KIND_CHOICES = [
         (KIND_FULL, "Whole booking"),
         (KIND_PARTIAL, "Selected nights"),
+        (KIND_SERVICES, "Extra services"),
     ]
 
     booking = models.ForeignKey(
@@ -2208,8 +2356,18 @@ class BookingCancellation(models.Model):
     kind = models.CharField(max_length=12, choices=KIND_CHOICES, default=KIND_PARTIAL)
     # The nights given up, as ISO dates in order. A full cancellation lists
     # every night the booking still held, so the two kinds read alike.
+    #
+    # A SERVICES row is the odd one out: the stay is untouched and every one of
+    # these nights is still the guest's — they are the nights the service was
+    # refunded OVER, which is what makes the amount checkable. That is why
+    # `nights_count` stays 0 on it: no night was given up (see
+    # Booking.cancelled_nights, which reads what the stay holds, not these rows).
     nights = models.JSONField(default=list, blank=True)
     nights_count = models.PositiveIntegerField(default=0)
+    # On a SERVICES row, what was handed back: {"name", "price", "nights",
+    # "amount"} each, frozen exactly as BookingAddition.services freezes a
+    # purchase. Empty on the other two kinds, whose subject is nights.
+    services = models.JSONField(default=list, blank=True)
     # What those nights were worth of the booking total, and how that split.
     # `stay_value` = `cancellation_fee` + `refund_amount`, always.
     stay_value = models.DecimalField(max_digits=10, decimal_places=2, default=0)

@@ -54,6 +54,13 @@ class ExtraServiceType:
     # carried on over the nights being added, rather than bought in that
     # purchase. False everywhere else (see BookingAddition.services).
     carried: bool = False
+    # On a BOOKING's own list: the guest has since dropped this service and been
+    # refunded for the nights of it that hadn't started (see
+    # properties/removals.py). `nights`/`amount` above still say what it was
+    # CHARGED over — that is what the payment column adds up — and `refunded` is
+    # how much of it came back. Both are 0 / false everywhere else.
+    removed: bool = False
+    refunded: float = 0
 
 
 @strawberry.input
@@ -237,19 +244,26 @@ class StaySegmentType:
 @strawberry.type
 class BookingCancellationType:
     """
-    One cancellation event on a booking — the receipt for a whole stay called
-    off, or for the nights of it that were given up (see BookingCancellation).
+    One thing given back off a booking — the receipt for a whole stay called
+    off, for the nights of it that were given up, or for an extra service
+    dropped (see BookingCancellation).
 
     A booking may carry several: a guest can drop two nights this week and three
     more later, and each is priced and refunded on the day it happens.
     """
 
     id: strawberry.ID
-    # "full" — the stay was called off — or "partial", some of its nights.
+    # "full" — the stay was called off — "partial", some of its nights, or
+    # "services", an extra service dropped off the nights it hadn't been
+    # delivered on yet.
     kind: str
-    # The nights given up, ISO dates in order, and how many that is.
+    # The nights given up, ISO dates in order, and how many that is. On a
+    # SERVICES row the stay is untouched and keeps every one of them: they are
+    # the nights the service was refunded OVER, which is why the count is 0.
     nights: List[str]
     nights_count: int
+    # What was dropped, on a services row. Empty on the other two kinds.
+    services: List[ExtraServiceType]
     # What those nights were worth of the booking total, and how it split.
     # stay_value = cancellation_fee + refund_amount, always.
     stay_value: float
@@ -271,6 +285,16 @@ class BookingCancellationType:
                 kind=row.kind,
                 nights=[n.isoformat() for n in row.night_dates()],
                 nights_count=int(row.nights_count or 0),
+                services=[
+                    ExtraServiceType(
+                        name=str(s.get("name", "")),
+                        price=float(s.get("price", 0) or 0),
+                        nights=int(s.get("nights", 0) or 0),
+                        amount=float(s.get("amount", 0) or 0),
+                    )
+                    for s in (row.services or [])
+                    if isinstance(s, dict) and s.get("name")
+                ],
                 stay_value=float(row.stay_value or 0),
                 cancellation_fee=float(row.cancellation_fee or 0),
                 refund_amount=float(row.refund_amount or 0),
@@ -391,6 +415,69 @@ class ServiceQuoteType:
 
 
 @strawberry.type
+class RemovableServiceType:
+    """
+    One extra service on a booking that can still be dropped, and what dropping
+    it would hand back (see properties/removals.removable_services).
+
+    `nights` are the nights of it that HAVEN'T started — the ones coming back,
+    in full — and `amount` is what they are worth. `kept` are the nights of it
+    already under way: they stay bought and stay charged, because the host has
+    delivered them. A service with nothing ahead of it is not listed at all.
+    """
+
+    name: str
+    price: float
+    nights: int
+    amount: float
+    kept: int
+
+
+@strawberry.type
+class ServiceRemovalQuoteType:
+    """
+    What dropping a set of extra services would refund right now, priced by the
+    server with the same code the removal itself runs (see
+    properties/removals.quote_removal).
+
+    The mirror of ServiceQuoteType: `allowed` false means it can't go through
+    and `error` says why, so a selection the server would refuse arrives as a
+    sentence rather than as a button that fails when pressed.
+    """
+
+    services: List[RemovableServiceType]
+    # The nights being refunded over, in date order. The stay still holds every
+    # one of them — only the service on them is going.
+    nights: List[str]
+    nights_count: int
+    amount: float
+    allowed: bool
+    message: str
+    error: str
+
+    @classmethod
+    def from_quote(cls, quote) -> "ServiceRemovalQuoteType":
+        return cls(
+            services=[
+                RemovableServiceType(
+                    name=s["name"],
+                    price=float(s["price"]),
+                    nights=int(s["nights"]),
+                    amount=float(s["amount"]),
+                    kept=int(s["kept"]),
+                )
+                for s in quote.services
+            ],
+            nights=[n.isoformat() for n in quote.nights],
+            nights_count=quote.nights_count,
+            amount=float(quote.amount),
+            allowed=quote.allowed,
+            message=quote.message,
+            error=quote.error,
+        )
+
+
+@strawberry.type
 class NightsQuoteType:
     """
     What extending a booking over a set of dates would cost right now (see
@@ -408,6 +495,9 @@ class NightsQuoteType:
     # Nights inside the range somebody else holds. Skipped rather than refused,
     # so the stay extends around them — the guest checks out and back in.
     skipped: List[str]
+    # Nights inside the range the guest had given back. Passed over on purpose:
+    # only a tap on the night itself takes one of those again, never a range.
+    declined: List[str]
     accommodation: float
     service_fee: float
     tax: float
@@ -429,6 +519,7 @@ class NightsQuoteType:
             nights_count=quote.nights_count,
             kept=[n.isoformat() for n in quote.kept],
             skipped=[n.isoformat() for n in quote.skipped],
+            declined=[n.isoformat() for n in quote.declined],
             accommodation=float(quote.accommodation),
             service_fee=float(quote.service_fee),
             tax=float(quote.tax),
@@ -492,8 +583,8 @@ class ChangesQuoteType:
 class BookingEditOptionsType:
     """
     Everything the "edit booking" screen needs to draw itself, in one round
-    trip: what may still be added to this stay, and the calendar it may be
-    extended over.
+    trip: what may still be added to this stay, what may be dropped from it, and
+    the calendar it may be extended over.
 
     The calendar is this BOOKING's, not the villa's: the nights it already holds
     are not obstacles to it (`unavailable_dates` leaves them out), and `own
@@ -506,9 +597,15 @@ class BookingEditOptionsType:
     # guest has everything on offer — and the "add a service" door should not be
     # shown at all rather than opening onto an empty list.
     available_services: List[ExtraServiceType]
+    # The services this booking HAS that can still be dropped, each with what
+    # dropping it would refund. Empty means there is nothing to give back —
+    # either the stay has no services, or every night of the ones it has is
+    # already under way — and the remove list isn't drawn at all.
+    removable_services: List[RemovableServiceType]
     # Whether each door is open, and the one sentence explaining a shut one.
     can_add_services: bool
     can_add_nights: bool
+    can_remove_services: bool
     blocked_reason: str
     # The nights a service bought now would be charged over (the stay's nights
     # that haven't started), and the nightly rate a new night would cost.
@@ -540,12 +637,19 @@ class BookingEditOptionsType:
 
     @classmethod
     def from_booking(cls, booking, now=None) -> "BookingEditOptionsType":
-        from properties import additions as addons
+        from properties import additions as addons, removals
 
         now = now or timezone.now()
         villa = booking.villa
-        blocked = addons.blocked_reason(booking, now)
+        # Two questions, not one. `blocked` is why nothing more can be BOUGHT —
+        # which a removed listing answers on its own. `drop_blocked` is why
+        # nothing can be given BACK, and a removed listing is no answer to that:
+        # the guest's refund is still theirs. So a stay on a property the host
+        # has taken down opens this screen with the remove list alone.
+        blocked = addons.purchase_blocked_reason(booking, now)
+        drop_blocked = addons.blocked_reason(booking, now)
         offered = booking.available_extra_services()
+        droppable = [] if drop_blocked else removals.removable_services(booking, now)
         chargeable = len(booking.unstarted_nights(now))
         return cls(
             booking_id=strawberry.ID(str(booking.pk)),
@@ -553,8 +657,19 @@ class BookingEditOptionsType:
                 ExtraServiceType(name=s["name"], price=float(s["price"]))
                 for s in offered
             ],
+            removable_services=[
+                RemovableServiceType(
+                    name=s["name"],
+                    price=float(s["price"]),
+                    nights=int(s["nights"]),
+                    amount=float(s["amount"]),
+                    kept=int(s["kept"]),
+                )
+                for s in droppable
+            ],
             can_add_services=bool(not blocked and offered and chargeable),
             can_add_nights=not blocked,
+            can_remove_services=bool(droppable),
             blocked_reason=blocked,
             chargeable_nights=chargeable,
             price_per_night=float(booking.price_per_night or villa.price_per_night or 0),
@@ -1026,6 +1141,17 @@ class BookingType:
     villa_cover: str
     villa_city: str
     villa_country: str
+    # --- The listing, when its host has taken it down (Villa.soft_delete) ---
+    # The stay itself is untouched by that: it is checked in, checked out,
+    # cancelled and reviewed on exactly the terms it was booked on. What changes
+    # is how this row READS — the property is no longer somewhere anybody can
+    # go and look at, so the title stops being a link, the photo goes grey, and
+    # `villa_removed_message` says why in the reader's own terms: the guest is
+    # told the property is no longer listed, the host is told THEY removed it.
+    villa_removed: bool
+    # ISO-8601 instant of the removal, or "" — for "removed on 3 Mar 2026".
+    villa_removed_at: str
+    villa_removed_message: str
     guest_name: str
     guest_avatar: str
     guest_email: str
@@ -1055,6 +1181,8 @@ class BookingType:
     tax: float
     # Extra services the guest chose (name + per-night price) and their summed
     # cost (price × nights). Frozen at booking time, added straight into total.
+    # One dropped since is still listed, marked `removed` and carrying what came
+    # back: these lines are what was CHARGED, and refunds come off below them.
     extra_services: List[ExtraServiceType]
     extras_total: float
     total: float
@@ -1271,13 +1399,14 @@ class BookingType:
         cancellable_nights = booking.cancellable_nights(now)
         # And the same for the other direction: what has been ADDED since, and
         # whether anything more may be. A stay can only grow while it still has
-        # nights ahead of it — see properties/additions.blocked_reason, which is
-        # what the mutations enforce and this only mirrors.
+        # nights ahead of it and a listing to buy them on — see properties/
+        # additions.purchase_blocked_reason, which is what the mutations enforce
+        # and this only mirrors.
         addition_rows = list(booking.additions.all())
         from properties import additions as addons
 
         unstarted = booking.unstarted_nights(now)
-        can_add = not cancelled and not addons.blocked_reason(booking, now)
+        can_add = not cancelled and not addons.purchase_blocked_reason(booking, now)
 
         # The live check-in PIN, if there is one. Which of its fields are filled
         # in depends entirely on who is asking: the digits go to the guest and
@@ -1346,6 +1475,17 @@ class BookingType:
             villa_cover=absolute(villa.cover_image_url),
             villa_city=booking.villa_city or villa.city,
             villa_country=booking.villa_country or villa.country,
+            # Worded for whoever is reading: the host who took the listing down
+            # is told so as something they did, everyone else is told the
+            # property is simply no longer listed. `viewer` is read the same way
+            # the PIN fields above read it — from the JWT, not request.user.
+            villa_removed=villa.is_deleted,
+            villa_removed_at=(
+                villa.deleted_at.isoformat() if villa.deleted_at else ""
+            ),
+            villa_removed_message=villa.removal_message(
+                for_owner=viewer is not None and viewer.pk == villa.owner_id
+            ),
             guest_name=(guest.full_name or guest.email or "").strip(),
             guest_avatar=guest.avatar or "",
             guest_email=guest.email or "",
@@ -1380,6 +1520,12 @@ class BookingType:
                             Decimal("0.01")
                         )
                     ),
+                    # And what came back off it, on a service since dropped. The
+                    # two above stay the CHARGE — the payment column adds them
+                    # up, and the refund comes off at the foot of it with every
+                    # other refund — so this only marks the line.
+                    removed=booking.service_removed(s),
+                    refunded=float(booking.service_refunded_value(s)),
                 )
                 for s in (booking.extra_services or [])
                 if isinstance(s, dict) and s.get("name")
