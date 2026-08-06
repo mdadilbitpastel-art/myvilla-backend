@@ -346,6 +346,10 @@ class NightsCancellationQuote:
     # `refund_amount`, called out separately so the guest can see why the
     # refund is more than the tier alone would give.
     extras_value: Decimal = Decimal("0.00")
+    # Of `stay_value`, the platform fee on those nights — kept in full, whatever
+    # the ladder allows on the accommodation. Part of `penalty_amount`, named
+    # separately so a refund smaller than the tier suggests explains itself.
+    service_fee: Decimal = Decimal("0.00")
 
     @property
     def nights_count(self) -> int:
@@ -562,8 +566,8 @@ class Booking(models.Model):
     # empty nights, so the less comes back — the standard travel-industry slab:
     #
     #   15 days or more before check-in → 100% back, free
-    #   7–15 days                       →  90% back, 10% charge
-    #   3–7 days                        →  50% back, 50% charge
+    #   7–15 days                       →  50% back, 50% charge
+    #   3–7 days                        →  25% back, 75% charge
     #   24 hours–3 days                 →  10% back, 90% charge
     #   inside the last 24 hours        →   0% back — still cancellable, but the
     #                                       stay is non-refundable
@@ -594,8 +598,8 @@ class Booking(models.Model):
     # and the API's quoted figures all come through `refund_tier_at` below.
     REFUND_TIERS = (
         (15 * 24, 100, MSG_FREE),
-        (7 * 24, 90, "Cancelling now carries a 10% charge — 90% is refunded."),
-        (3 * 24, 50, "Cancelling now carries a 50% charge — half is refunded."),
+        (7 * 24, 50, "Cancelling now carries a 50% charge — half is refunded."),
+        (3 * 24, 25, "Cancelling now carries a 75% charge — 25% is refunded."),
         (NO_REFUND_WINDOW_HOURS, 10, "Cancelling now carries a 90% charge — 10% is refunded."),
         (0, 0, MSG_NO_REFUND),
     )
@@ -1487,6 +1491,28 @@ class Booking(models.Model):
             (self.extras_for_night(n) for n in nights), Decimal("0.00")
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
+    def service_fee_for_nights(self, nights) -> Decimal:
+        """
+        The platform's own fee on these nights — the part of their worth that
+        NEVER comes back.
+
+        The fee buys the booking, not the stay: the platform did its work when
+        the villa was found, held and paid for, and it did that work whether or
+        not the guest turns up. So it sits outside the ladder in the other
+        direction from the extra services, which come back whole because the
+        host has not delivered them yet.
+
+        Flat per night, like the accommodation it was charged on, so a night's
+        share of it is checkable against the receipt.
+        """
+        count = len(list(nights))
+        if not count:
+            return Decimal("0.00")
+        return (
+            Decimal(str(self.service_fee or 0)) * Decimal(count)
+            / Decimal(self.billed_nights())
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
     def stay_only_value(self, count: int) -> Decimal:
         """
         What `count` nights of ACCOMMODATION are worth — the stay's own money
@@ -1647,20 +1673,18 @@ class Booking(models.Model):
         the last night off the first would charge a guest for lateness they were
         nowhere near: the night they are handing back is three weeks away.
 
-        The exception is a part already under way, where the ladder does not
-        apply at all. Once the guest is in — or their arrival hour has been and
-        gone — the money for the rest of that part is spent, and the nights left
-        can still be handed back but at 0%. That is the same bargain leaving
-        early strikes, and it is decided per PART, because it is a fact about an
-        arrival rather than about a night.
+        A stay already under way is NO exception. Checking in settles the night
+        the guest is standing in — that one is theirs and is not on this list at
+        all — but it says nothing about a night ten days off. The host has the
+        same notice on that night as they would have had if the guest had never
+        arrived, so it comes back on the same band. A guest who checks in on
+        Friday and finds out on Saturday that they must leave next week is not
+        thereby charged for a fortnight nobody will sleep in.
         """
         now = now or timezone.now()
         tiers = {}
         for part in self.cancellable_parts(now):
             for night in part["nights"]:
-                if part["begun"]:
-                    tiers[night] = (part["refund_percentage"], part["message"])
-                    continue
                 percentage, message = self.refund_tier_at(
                     self.night_starts_at(night), now
                 )
@@ -1846,9 +1870,22 @@ class Booking(models.Model):
                 # a service on it hands back more than its percentage suggests.
                 value = self.nights_value([night], empties=False)
                 extras = min(self.extras_for_night(night), value)
-                refund = extras + (
-                    (value - extras) * Decimal(percentage) / Decimal(100)
-                ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                # The platform's fee on this night is kept whatever the band
+                # says, so the ladder is charged against what is left after it
+                # and after the services (see `service_fee_for_nights`).
+                fee = min(self.service_fee_for_nights([night]), value - extras)
+                refund = (
+                    extras
+                    + (
+                        (value - extras - fee) * Decimal(percentage) / Decimal(100)
+                    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    # A night that can't go hands back nothing — not even its
+                    # services. It is being slept in, or its hour went by with
+                    # the host standing ready: either way the evening was
+                    # delivered. Only an OPEN night has a refund to quote.
+                    if state == self.NIGHT_OPEN
+                    else Decimal("0.00")
+                )
                 add(night, index, state, percentage, message, value, refund)
                 night += timedelta(days=1)
 
@@ -1926,11 +1963,20 @@ class Booking(models.Model):
 
         empties = set(chosen) >= held
         stay_value = self.nights_value(chosen, empties=empties)
-        # The services on those nights, which come back whole (see
-        # `extras_for_nights`). The rest is the accommodation, and only that is
-        # what the cancellation ladder is charged against.
+        # What those nights are worth splits three ways, and only one of the
+        # three is the ladder's business.
+        #
+        #   * the extra services on them come back WHOLE — the host has not
+        #     delivered them (see `extras_for_nights`);
+        #   * the platform's fee on them comes back NOT AT ALL — it bought the
+        #     booking, and the booking happened (see `service_fee_for_nights`);
+        #   * what is left is the accommodation and its tax, and that is what
+        #     the sliding scale is charged against, night by night.
         extras_value = min(self.extras_for_nights(chosen), stay_value)
-        accommodation = stay_value - extras_value
+        fee_kept = min(
+            self.service_fee_for_nights(chosen), stay_value - extras_value
+        )
+        accommodation = stay_value - extras_value - fee_kept
 
         # Priced NIGHT BY NIGHT, then added up: each night carries its own tier,
         # because each was given its own notice (see `night_refund_tiers`). The
@@ -1975,6 +2021,7 @@ class Booking(models.Model):
             allowed=True,
             message=self._refund_summary(bands),
             extras_value=extras_value,
+            service_fee=fee_kept,
         )
 
     @staticmethod

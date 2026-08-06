@@ -768,6 +768,11 @@ class NightsCancellationQuoteType:
     # nothing to keep a percentage of. Already inside `refund_amount`; named
     # separately so the summary can show why the refund beats the tier.
     extras_value: float
+    # And the other way: of `stay_value`, the platform fee on those nights. It
+    # comes back NOT AT ALL — the fee bought the booking, and the booking
+    # happened. Part of `cancellation_fee`, named separately so a refund
+    # SMALLER than the tier suggests explains itself too.
+    service_fee: float
     # True when the selection is every night still held: this is a whole-stay
     # cancellation, and the UI should say so rather than "3 nights".
     full: bool
@@ -785,6 +790,7 @@ class NightsCancellationQuoteType:
             refund_amount=float(quote.refund_amount),
             refund_percentage=int(quote.refund_percentage),
             extras_value=float(quote.extras_value),
+            service_fee=float(quote.service_fee),
             full=quote.full,
             allowed=quote.allowed,
             message=quote.message,
