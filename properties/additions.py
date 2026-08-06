@@ -232,6 +232,13 @@ def _stage_services(booking: Booking, quote: ServiceQuote, now) -> list:
                 "nights": service["nights"],
                 # Which nights these are, so a receipt can say more than a count.
                 "added_from": quote.nights[0].isoformat(),
+                # And WHICH ONES, named. The count and the start cannot be
+                # turned back into these: the nights a service is charged over
+                # are the ones still ahead of the guest, and on a split stay —
+                # or one with nights already given up — that is not a run. Read
+                # back by `Booking.service_billed_night_set`, so a removal hands
+                # back exactly the nights this purchase charged for.
+                "dates": [n.isoformat() for n in quote.nights],
                 "added_at": now.isoformat(),
             }
         )
@@ -516,18 +523,28 @@ def _stage_nights(booking: Booking, quote: NightsQuote) -> list:
     subtotal, fee, tax and the nights every per-night figure is worked out
     against all grow with it (see `Booking.billed_nights`).
     """
-    booking.add_nights(quote.nights)
-    booking.nights = int(booking.nights or 0) + quote.nights_count
-
     # Every service the stay still HAS now runs over the new nights too — and
     # is charged for them (see `quote_nights`). One that was given back is left
     # exactly as it is: its billed count is what the guest paid, and it covers
     # nothing in front of them any more.
+    #
+    # Read BEFORE the stay grows, written after. A service ticked at checkout
+    # carries no count and no dates of its own and falls back to the stay's, so
+    # asking it what it was billed over once the stay had already been extended
+    # would answer with the LONGER stay — and then the new nights would be added
+    # to it a second time.
     entries = booking.service_entries()
-    for entry in entries:
-        if booking.service_removed(entry):
-            continue
-        entry["nights"] = booking.service_nights(entry) + quote.nights_count
+    live = [e for e in entries if not booking.service_removed(e)]
+    frozen = [
+        (booking.service_nights(e), booking.service_billed_night_set(e)) for e in live
+    ]
+
+    booking.add_nights(quote.nights)
+    booking.nights = int(booking.nights or 0) + quote.nights_count
+
+    for entry, (count, dates) in zip(live, frozen):
+        entry["nights"] = count + quote.nights_count
+        entry["dates"] = [n.isoformat() for n in sorted(dates | set(quote.nights))]
     booking.extra_services = entries
 
     booking.subtotal = _money(Decimal(str(booking.subtotal or 0)) + quote.accommodation)

@@ -1444,29 +1444,83 @@ class Booking(models.Model):
             nights.update(row.night_dates())
         return sorted(nights)
 
-    def service_covered_nights(self, entry) -> set:
+    def service_billed_night_set(self, entry) -> set:
         """
-        Which nights one extra service actually covers — NOW.
+        The nights one extra service was CHARGED over — named, not counted.
 
-        A service ticked at checkout runs the whole stay. One bought later runs
-        from the night it was bought (`added_from`) for as many nights as it was
-        charged over — and a stay extended afterwards carries it on, which is
-        why the count is read live rather than assumed (see `service_nights`).
+        Named, because a count cannot be turned back into the right dates. A
+        service is charged over the nights of the stay that hadn't started when
+        it was bought (see additions.quote_services), and those nights need not
+        sit in a row: a split stay has gaps in it, and so does a stay with
+        nights already given up. `dates` on the entry is that exact set, frozen
+        at the moment the money was taken, so what a removal hands back is what
+        the purchase took — which is the whole point (see properties/removals).
 
-        A service the guest has since GIVEN BACK covers only the nights it was
-        actually delivered on: the ones it stopped covering are named on the
-        entry (see `service_refunded_night_set`) and taken out here, so
-        cancelling one of them later can't hand its money back a second time.
+        Everything below it is for entries frozen before `dates` existed, which
+        carry only a start and a count. Their nights are re-derived: the booked
+        nights from the start onwards, as many of them as the service was billed
+        for. That reading is right whenever those nights ran together, and wrong
+        the moment they didn't — it reaches across nights the guest had ALREADY
+        given up before the service was even bought, spending the service's
+        count on dates it was never charged for, and the removal then hands back
+        fewer nights than the purchase took. (A night given up AFTER the service
+        was bought is the opposite case and must stay counted: it WAS covered,
+        and its share came back with the night itself — see `extras_for_nights`.)
+
+        So the early-cancelled nights are dropped — but only while the stricter
+        reading can still account for every night the guest was billed for. If
+        it can't, the record is too thin to say which nights those were, and the
+        old reading stands: under-counting here would be the very bug this is
+        fixing, and a guess that refunds too little is worse than the reading
+        that at least adds up.
         """
+        entry = entry or {}
+        stored = set()
+        for raw in entry.get("dates") or []:
+            try:
+                stored.add(date.fromisoformat(str(raw)[:10]))
+            except (TypeError, ValueError):
+                continue
+        if stored:
+            return stored
+
         nights = self.billed_night_set()
-        raw = (entry or {}).get("added_from")
+        raw = entry.get("added_from")
         if raw:
             try:
                 first = date.fromisoformat(str(raw)[:10])
                 nights = [n for n in nights if n >= first]
             except ValueError:
                 pass
-        return set(nights[: self.service_nights(entry)]) - self.service_refunded_night_set(
+
+        billed = self.service_nights(entry)
+        stamp = parse_datetime(str(entry.get("added_at") or ""))
+        bought_at = self._aware(stamp) if stamp else None
+        if bought_at:
+            gone_first = set()
+            for row in self.cancellations.all():
+                if row.created_at and row.created_at < bought_at:
+                    gone_first.update(row.night_dates())
+            # A night given up and later bought back is on the stay again, so it
+            # was never missing from what the service could be charged over.
+            gone_first -= set(self.occupied_nights())
+            strict = [n for n in nights if n not in gone_first]
+            if len(strict) >= billed:
+                nights = strict
+        return set(nights[:billed])
+
+    def service_covered_nights(self, entry) -> set:
+        """
+        Which nights one extra service actually covers — NOW.
+
+        What it was charged over (see `service_billed_night_set`), less what it
+        has since STOPPED covering. A service the guest has given back covers
+        only the nights it was actually delivered on: the ones it stopped
+        covering are named on the entry (see `service_refunded_night_set`) and
+        taken out here, so cancelling one of them later can't hand the same
+        money back a second time.
+        """
+        return self.service_billed_night_set(entry) - self.service_refunded_night_set(
             entry
         )
 
@@ -2226,12 +2280,20 @@ class Booking(models.Model):
         their own; one bought later runs only from the night it was bought, and
         says so. The fallback is what keeps every booking taken before this
         existed reading exactly as it always did.
+
+        `dates` says the same thing more precisely and is written beside the
+        count on every service bought since it existed, so the two can only
+        disagree on an entry hand-edited between them — where the named dates
+        are the better answer.
         """
         try:
             count = int((entry or {}).get("nights") or 0)
         except (TypeError, ValueError):
             count = 0
-        return count if count > 0 else self.billed_nights()
+        if count > 0:
+            return count
+        named = len((entry or {}).get("dates") or [])
+        return named if named > 0 else self.billed_nights()
 
     def service_refunded_night_set(self, entry) -> set:
         """
